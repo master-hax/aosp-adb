@@ -51,9 +51,9 @@
 #include "adb_auth.h"
 #include "adb_io.h"
 #include "adb_listeners.h"
+#include "adb_mdns.h"
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
-#include "adb_wifi.h"
 #include "sysdeps/chrono.h"
 #include "transport.h"
 
@@ -68,6 +68,25 @@ using namespace std::chrono_literals;
 
 #if ADB_HOST
 #include "client/usb.h"
+#endif
+
+#if !ADB_HOST && defined(__ANDROID__)
+#include "daemon/watchdog.h"
+
+static std::atomic<int> active_connections = 0;
+
+static void IncrementActiveConnections() {
+    if (active_connections++ == 0) {
+        watchdog::Stop();
+    }
+}
+
+static void DecrementActiveConnections() {
+    if (--active_connections == 0) {
+        watchdog::Start();
+    }
+}
+
 #endif
 
 std::string adb_version() {
@@ -111,6 +130,8 @@ void handle_online(atransport *t)
     t->online = 1;
 #if ADB_HOST
     t->SetConnectionEstablished(true);
+#elif defined(__ANDROID__)
+    IncrementActiveConnections();
 #endif
 }
 
@@ -122,6 +143,10 @@ void handle_offline(atransport *t)
     }
 
     LOG(INFO) << t->serial_name() << ": offline";
+
+#if !ADB_HOST && defined(__ANDROID__)
+    DecrementActiveConnections();
+#endif
 
     t->SetConnectionState(kCsOffline);
 
