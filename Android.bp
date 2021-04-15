@@ -64,6 +64,10 @@ cc_defaults {
                 "-framework IOKit",
                 "-lobjc",
             ],
+            cflags: [
+                // Required, to use the new IPv6 Sockets options introduced by RFC 3542.
+                "-D__APPLE_USE_RFC_3542",
+            ],
         },
 
         windows: {
@@ -845,6 +849,9 @@ python_test_host {
             enabled: true,
         },
     },
+    test_options: {
+        unit_test: false,
+    },
 }
 
 python_test_host {
@@ -865,6 +872,9 @@ python_test_host {
         py3: {
             enabled: true,
         },
+    },
+    test_options: {
+        unit_test: false,
     },
 }
 
