@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2020 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,522 +26,384 @@
 
 #include <memory>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <dns_sd.h>
+
+#include <discovery/common/config.h>
+#include <discovery/common/reporting_client.h>
+#include <discovery/public/dns_sd_service_factory.h>
+#include <platform/api/network_interface.h>
+#include <platform/api/serial_delete_ptr.h>
+#include <platform/base/error.h>
+#include <platform/base/interface_info.h>
 
 #include "adb_client.h"
 #include "adb_mdns.h"
 #include "adb_trace.h"
 #include "adb_utils.h"
 #include "adb_wifi.h"
+#include "client/mdns_utils.h"
+#include "client/openscreen/mdns_service_watcher.h"
+#include "client/openscreen/platform/task_runner.h"
 #include "fdevent/fdevent.h"
 #include "sysdeps.h"
 
-static DNSServiceRef service_refs[kNumADBDNSServices];
-static fdevent* service_ref_fdes[kNumADBDNSServices];
+namespace {
 
-static int adb_DNSServiceIndexByName(const char* regType) {
-    for (int i = 0; i < kNumADBDNSServices; ++i) {
-        if (!strncmp(regType, kADBDNSServices[i], strlen(kADBDNSServices[i]))) {
-            return i;
-        }
-    }
-    return -1;
-}
+using namespace mdns;
+using namespace openscreen;
+using ServicesUpdatedState = mdns::ServiceReceiver::ServicesUpdatedState;
 
-static bool adb_DNSServiceShouldConnect(const char* regType, const char* serviceName) {
-    int index = adb_DNSServiceIndexByName(regType);
-    if (index == kADBTransportServiceRefIndex) {
-        // Ignore adb-EMULATOR* service names, as it interferes with the
-        // emulator ports that are already connected.
-        if (android::base::StartsWith(serviceName, "adb-EMULATOR")) {
-            LOG(INFO) << "Ignoring emulator transport service [" << serviceName << "]";
-            return false;
-        }
-    }
-    return (index == kADBTransportServiceRefIndex || index == kADBSecureConnectServiceRefIndex);
-}
+struct DiscoveryState;
+DiscoveryState* g_state = nullptr;
+// TODO: remove once openscreen has bonjour client APIs.
+bool g_using_bonjour = false;
+AdbMdnsResponderFuncs g_adb_mdnsresponder_funcs;
 
-// Use adb_DNSServiceRefSockFD() instead of calling DNSServiceRefSockFD()
-// directly so that the socket is put through the appropriate compatibility
-// layers to work with the rest of ADB's internal APIs.
-static inline int adb_DNSServiceRefSockFD(DNSServiceRef ref) {
-    return adb_register_socket(DNSServiceRefSockFD(ref));
-}
-#define DNSServiceRefSockFD ___xxx_DNSServiceRefSockFD
-
-static void DNSSD_API register_service_ip(DNSServiceRef sdRef,
-                                          DNSServiceFlags flags,
-                                          uint32_t interfaceIndex,
-                                          DNSServiceErrorType errorCode,
-                                          const char* hostname,
-                                          const sockaddr* address,
-                                          uint32_t ttl,
-                                          void* context);
-
-static void pump_service_ref(int /*fd*/, unsigned ev, void* data) {
-    DNSServiceRef* ref = reinterpret_cast<DNSServiceRef*>(data);
-
-    if (ev & FDE_READ)
-        DNSServiceProcessResult(*ref);
-}
-
-class AsyncServiceRef {
+class DiscoveryReportingClient : public discovery::ReportingClient {
   public:
-    bool Initialized() {
-        return initialized_;
+    void OnFatalError(Error error) override {
+        // The multicast port 5353 may fail to bind because of another process already binding
+        // to it (bonjour). So let's fallback to bonjour client APIs.
+        // TODO: Remove this once openscreen implements the bonjour client APIs.
+        LOG(ERROR) << "Encountered fatal discovery error: " << error;
+        got_fatal_ = true;
     }
 
-    virtual ~AsyncServiceRef() {
-        if (!initialized_) {
-            return;
-        }
-
-        // Order matters here! Must destroy the fdevent first since it has a
-        // reference to |sdRef_|.
-        fdevent_destroy(fde_);
-        DNSServiceRefDeallocate(sdRef_);
+    void OnRecoverableError(Error error) override {
+        LOG(ERROR) << "Encountered recoverable discovery error: " << error;
     }
 
-  protected:
-    DNSServiceRef sdRef_;
-
-    void Initialize() {
-        fde_ = fdevent_create(adb_DNSServiceRefSockFD(sdRef_), pump_service_ref, &sdRef_);
-        if (fde_ == nullptr) {
-            D("Unable to create fdevent");
-            return;
-        }
-        fdevent_set(fde_, FDE_READ);
-        initialized_ = true;
-    }
+    bool GotFatalError() const { return got_fatal_; }
 
   private:
-    bool initialized_ = false;
-    fdevent* fde_;
+    std::atomic<bool> got_fatal_{false};
 };
 
-class ResolvedService : public AsyncServiceRef {
-  public:
-    virtual ~ResolvedService() = default;
+struct DiscoveryState {
+    SerialDeletePtr<discovery::DnsSdService> service;
+    std::unique_ptr<DiscoveryReportingClient> reporting_client;
+    std::unique_ptr<AdbOspTaskRunner> task_runner;
+    std::vector<std::unique_ptr<ServiceReceiver>> receivers;
+    InterfaceInfo interface_info;
+};
 
-    ResolvedService(std::string serviceName, std::string regType, uint32_t interfaceIndex,
-                    const char* hosttarget, uint16_t port, int version)
-        : serviceName_(serviceName),
-          regType_(regType),
-          hosttarget_(hosttarget),
-          port_(port),
-          sa_family_(0),
-          ip_addr_data_(NULL),
-          serviceVersion_(version) {
-        memset(ip_addr_, 0, sizeof(ip_addr_));
+// Callback provided to service receiver for updates.
+void OnServiceReceiverResult(std::vector<std::reference_wrapper<const ServiceInfo>> infos,
+                             std::reference_wrapper<const ServiceInfo> info,
+                             ServicesUpdatedState state) {
+    LOG(INFO) << "Endpoint state=" << static_cast<int>(state)
+              << " instance_name=" << info.get().instance_name
+              << " service_name=" << info.get().service_name << " addr=" << info.get().v4_address
+              << " addrv6=" << info.get().v6_address << " total_serv=" << infos.size();
 
-        /* TODO: We should be able to get IPv6 support by adding
-         * kDNSServiceProtocol_IPv6 to the flags below. However, when we do
-         * this, we get served link-local addresses that are usually useless to
-         * connect to. What's more, we seem to /only/ get those and nothing else.
-         * If we want IPv6 in the future we'll have to figure out why.
-         */
-        DNSServiceErrorType ret =
-            DNSServiceGetAddrInfo(
-                &sdRef_, 0, interfaceIndex,
-                kDNSServiceProtocol_IPv4, hosttarget,
-                register_service_ip, reinterpret_cast<void*>(this));
+    switch (state) {
+        case ServicesUpdatedState::EndpointCreated:
+        case ServicesUpdatedState::EndpointUpdated:
+            if (adb_DNSServiceShouldAutoConnect(info.get().service_name,
+                                                info.get().instance_name) &&
+                info.get().v4_address) {
+                auto index = adb_DNSServiceIndexByName(info.get().service_name);
+                if (!index) {
+                    return;
+                }
 
-        if (ret != kDNSServiceErr_NoError) {
-            D("Got %d from DNSServiceGetAddrInfo.", ret);
-        } else {
-            Initialize();
-        }
-
-        D("Client version: %d Service version: %d\n", clientVersion_, serviceVersion_);
-    }
-
-    bool ConnectSecureWifiDevice() {
-        if (!adb_wifi_is_known_host(serviceName_)) {
-            LOG(INFO) << "serviceName=" << serviceName_ << " not in keystore";
-            return false;
-        }
-
-        std::string response;
-        connect_device(android::base::StringPrintf(addr_format_.c_str(), ip_addr_, port_),
-                       &response);
-        D("Secure connect to %s regtype %s (%s:%hu) : %s", serviceName_.c_str(), regType_.c_str(),
-          ip_addr_, port_, response.c_str());
-        return true;
-    }
-
-    void Connect(const sockaddr* address) {
-        sa_family_ = address->sa_family;
-
-        if (sa_family_ == AF_INET) {
-            ip_addr_data_ = &reinterpret_cast<const sockaddr_in*>(address)->sin_addr;
-            addr_format_ = "%s:%hu";
-        } else if (sa_family_ == AF_INET6) {
-            ip_addr_data_ = &reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr;
-            addr_format_ = "[%s]:%hu";
-        } else {  // Should be impossible
-            D("mDNS resolved non-IP address.");
-            return;
-        }
-
-        // Winsock version requires the const cast Because Microsoft.
-        if (!inet_ntop(sa_family_, const_cast<void*>(ip_addr_data_), ip_addr_, sizeof(ip_addr_))) {
-            D("Could not convert IP address to string.");
-            return;
-        }
-
-        // adb secure service needs to do something different from just
-        // connecting here.
-        if (adb_DNSServiceShouldConnect(regType_.c_str(), serviceName_.c_str())) {
-            std::string response;
-            D("Attempting to serviceName=[%s], regtype=[%s] ipaddr=(%s:%hu)", serviceName_.c_str(),
-              regType_.c_str(), ip_addr_, port_);
-            int index = adb_DNSServiceIndexByName(regType_.c_str());
-            if (index == kADBSecureConnectServiceRefIndex) {
-                ConnectSecureWifiDevice();
-            } else {
-                connect_device(android::base::StringPrintf(addr_format_.c_str(), ip_addr_, port_),
-                               &response);
-                D("Connect to %s regtype %s (%s:%hu) : %s", serviceName_.c_str(), regType_.c_str(),
-                  ip_addr_, port_, response.c_str());
+                // Don't try to auto-connect if not in the keystore.
+                if (*index == kADBSecureConnectServiceRefIndex &&
+                    !adb_wifi_is_known_host(info.get().instance_name)) {
+                    LOG(INFO) << "instance_name=" << info.get().instance_name << " not in keystore";
+                    return;
+                }
+                std::string response;
+                LOG(INFO) << "Attempting to auto-connect to instance=" << info.get().instance_name
+                          << " service=" << info.get().service_name << " addr4=%s"
+                          << info.get().v4_address << ":" << info.get().port;
+                connect_device(
+                        android::base::StringPrintf("%s.%s", info.get().instance_name.c_str(),
+                                                    info.get().service_name.c_str()),
+                        &response);
             }
-        } else {
-            D("Not immediately connecting to serviceName=[%s], regtype=[%s] ipaddr=(%s:%hu)",
-              serviceName_.c_str(), regType_.c_str(), ip_addr_, port_);
-        }
-
-        int adbSecureServiceType = serviceIndex();
-        switch (adbSecureServiceType) {
-            case kADBSecurePairingServiceRefIndex:
-                sAdbSecurePairingServices->push_back(this);
-                break;
-            case kADBSecureConnectServiceRefIndex:
-                sAdbSecureConnectServices->push_back(this);
-                break;
-            default:
-                break;
-        }
-    }
-
-    int serviceIndex() const { return adb_DNSServiceIndexByName(regType_.c_str()); }
-
-    std::string hostTarget() const { return hosttarget_; }
-
-    std::string serviceName() const { return serviceName_; }
-
-    std::string ipAddress() const { return ip_addr_; }
-
-    uint16_t port() const { return port_; }
-
-    using ServiceRegistry = std::vector<ResolvedService*>;
-
-    static ServiceRegistry* sAdbSecurePairingServices;
-    static ServiceRegistry* sAdbSecureConnectServices;
-
-    static void initAdbSecure();
-
-    static void forEachService(const ServiceRegistry& services, const std::string& hostname,
-                               adb_secure_foreach_service_callback cb);
-
-    static bool connectByServiceName(const ServiceRegistry& services,
-                                     const std::string& service_name);
-
-  private:
-    int clientVersion_ = ADB_SECURE_CLIENT_VERSION;
-    std::string addr_format_;
-    std::string serviceName_;
-    std::string regType_;
-    std::string hosttarget_;
-    const uint16_t port_;
-    int sa_family_;
-    const void* ip_addr_data_;
-    char ip_addr_[INET6_ADDRSTRLEN];
-    int serviceVersion_;
-};
-
-// static
-std::vector<ResolvedService*>* ResolvedService::sAdbSecurePairingServices = NULL;
-
-// static
-std::vector<ResolvedService*>* ResolvedService::sAdbSecureConnectServices = NULL;
-
-// static
-void ResolvedService::initAdbSecure() {
-    if (!sAdbSecurePairingServices) {
-        sAdbSecurePairingServices = new ServiceRegistry;
-    }
-    if (!sAdbSecureConnectServices) {
-        sAdbSecureConnectServices = new ServiceRegistry;
-    }
-}
-
-// static
-void ResolvedService::forEachService(const ServiceRegistry& services,
-                                     const std::string& wanted_service_name,
-                                     adb_secure_foreach_service_callback cb) {
-    initAdbSecure();
-
-    for (auto service : services) {
-        auto service_name = service->serviceName();
-        auto ip = service->ipAddress();
-        auto port = service->port();
-
-        if (wanted_service_name == "") {
-            cb(service_name.c_str(), ip.c_str(), port);
-        } else if (service_name == wanted_service_name) {
-            cb(service_name.c_str(), ip.c_str(), port);
-        }
-    }
-}
-
-// static
-bool ResolvedService::connectByServiceName(const ServiceRegistry& services,
-                                           const std::string& service_name) {
-    initAdbSecure();
-    for (auto service : services) {
-        if (service_name == service->serviceName()) {
-            D("Got service_name match [%s]", service->serviceName().c_str());
-            return service->ConnectSecureWifiDevice();
-        }
-    }
-    D("No registered serviceNames matched [%s]", service_name.c_str());
-    return false;
-}
-
-void adb_secure_foreach_pairing_service(const char* service_name,
-                                        adb_secure_foreach_service_callback cb) {
-    ResolvedService::forEachService(*ResolvedService::sAdbSecurePairingServices,
-                                    service_name ? service_name : "", cb);
-}
-
-void adb_secure_foreach_connect_service(const char* service_name,
-                                        adb_secure_foreach_service_callback cb) {
-    ResolvedService::forEachService(*ResolvedService::sAdbSecureConnectServices,
-                                    service_name ? service_name : "", cb);
-}
-
-bool adb_secure_connect_by_service_name(const char* service_name) {
-    return ResolvedService::connectByServiceName(*ResolvedService::sAdbSecureConnectServices,
-                                                 service_name);
-}
-
-static void DNSSD_API register_service_ip(DNSServiceRef /*sdRef*/,
-                                          DNSServiceFlags /*flags*/,
-                                          uint32_t /*interfaceIndex*/,
-                                          DNSServiceErrorType /*errorCode*/,
-                                          const char* /*hostname*/,
-                                          const sockaddr* address,
-                                          uint32_t /*ttl*/,
-                                          void* context) {
-    D("Got IP for service.");
-    std::unique_ptr<ResolvedService> data(
-        reinterpret_cast<ResolvedService*>(context));
-    data->Connect(address);
-
-    // For ADB Secure services, keep those ResolvedService's around
-    // for later processing with secure connection establishment.
-    if (data->serviceIndex() != kADBTransportServiceRefIndex) {
-        data.release();
-    }
-}
-
-static void DNSSD_API register_resolved_mdns_service(DNSServiceRef sdRef,
-                                                     DNSServiceFlags flags,
-                                                     uint32_t interfaceIndex,
-                                                     DNSServiceErrorType errorCode,
-                                                     const char* fullname,
-                                                     const char* hosttarget,
-                                                     uint16_t port,
-                                                     uint16_t txtLen,
-                                                     const unsigned char* txtRecord,
-                                                     void* context);
-
-class DiscoveredService : public AsyncServiceRef {
-  public:
-    DiscoveredService(uint32_t interfaceIndex, const char* serviceName, const char* regtype,
-                      const char* domain)
-        : serviceName_(serviceName), regType_(regtype) {
-        DNSServiceErrorType ret =
-            DNSServiceResolve(&sdRef_, 0, interfaceIndex, serviceName, regtype,
-                              domain, register_resolved_mdns_service,
-                              reinterpret_cast<void*>(this));
-
-        D("DNSServiceResolve for "
-          "interfaceIndex %u "
-          "serviceName %s "
-          "regtype %s "
-          "domain %s "
-          ": %d",
-          interfaceIndex, serviceName, regtype, domain, ret);
-
-        if (ret == kDNSServiceErr_NoError) {
-            Initialize();
-        }
-    }
-
-    const char* ServiceName() {
-        return serviceName_.c_str();
-    }
-
-    const char* RegType() { return regType_.c_str(); }
-
-  private:
-    std::string serviceName_;
-    std::string regType_;
-};
-
-static void adb_RemoveDNSService(const char* regType, const char* serviceName) {
-    int index = adb_DNSServiceIndexByName(regType);
-    ResolvedService::ServiceRegistry* services;
-    switch (index) {
-        case kADBSecurePairingServiceRefIndex:
-            services = ResolvedService::sAdbSecurePairingServices;
-            break;
-        case kADBSecureConnectServiceRefIndex:
-            services = ResolvedService::sAdbSecureConnectServices;
             break;
         default:
+            break;
+    }
+}
+
+std::optional<discovery::Config> GetConfigForAllInterfaces() {
+    auto interface_infos = GetNetworkInterfaces();
+
+    discovery::Config config;
+    for (const auto interface : interface_infos) {
+        discovery::Config::NetworkInfo::AddressFamilies supported_address_families =
+                discovery::Config::NetworkInfo::kNoAddressFamily;
+        if (interface.GetIpAddressV4()) {
+            supported_address_families |= discovery::Config::NetworkInfo::kUseIpV4;
+        }
+        if (interface.GetIpAddressV6()) {
+            supported_address_families |= discovery::Config::NetworkInfo::kUseIpV6;
+        }
+        if (supported_address_families == discovery::Config::NetworkInfo::kNoAddressFamily) {
+            LOG(INFO) << "Interface [" << interface << "] doesn't support ipv4 or ipv6."
+                      << " Ignoring interface.";
+            continue;
+        }
+        config.network_info.push_back({interface, supported_address_families});
+        LOG(VERBOSE) << "Listening on interface [" << interface << "]";
+    }
+
+    if (config.network_info.empty()) {
+        LOG(INFO) << "No available network interfaces for mDNS discovery";
+        return std::nullopt;
+    }
+
+    return config;
+}
+
+void StartDiscovery() {
+    CHECK(!g_state);
+    g_state = new DiscoveryState();
+    g_state->task_runner = std::make_unique<AdbOspTaskRunner>();
+    g_state->reporting_client = std::make_unique<DiscoveryReportingClient>();
+
+    g_state->task_runner->PostTask([]() {
+        auto config = GetConfigForAllInterfaces();
+        if (!config) {
             return;
-    }
+        }
 
-    std::string sName(serviceName);
-    services->erase(std::remove_if(
-            services->begin(), services->end(),
-            [&sName](ResolvedService* service) { return (sName == service->serviceName()); }));
+        g_state->service = discovery::CreateDnsSdService(g_state->task_runner.get(),
+                                                         g_state->reporting_client.get(), *config);
+        // Register a receiver for each service type
+        for (int i = 0; i < kNumADBDNSServices; ++i) {
+            auto receiver = std::make_unique<ServiceReceiver>(
+                    g_state->service.get(), kADBDNSServices[i], OnServiceReceiverResult);
+            receiver->StartDiscovery();
+            g_state->receivers.push_back(std::move(receiver));
+
+            if (g_state->reporting_client->GotFatalError()) {
+                for (auto& r : g_state->receivers) {
+                    if (r->is_running()) {
+                        r->StopDiscovery();
+                    }
+                }
+                g_using_bonjour = true;
+                break;
+            }
+        }
+
+        if (g_using_bonjour) {
+            LOG(INFO) << "Fallback to MdnsResponder client for discovery";
+            g_adb_mdnsresponder_funcs = StartMdnsResponderDiscovery();
+        }
+    });
 }
 
-// Returns the version the device wanted to advertise,
-// or -1 if parsing fails.
-static int parse_version_from_txt_record(uint16_t txtLen, const unsigned char* txtRecord) {
-    if (!txtLen) return -1;
-    if (!txtRecord) return -1;
-
-    // https://tools.ietf.org/html/rfc6763
-    // """
-    // 6.1.  General Format Rules for DNS TXT Records
-    //
-    // A DNS TXT record can be up to 65535 (0xFFFF) bytes long.  The total
-    // length is indicated by the length given in the resource record header
-    // in the DNS message.  There is no way to tell directly from the data
-    // alone how long it is (e.g., there is no length count at the start, or
-    // terminating NULL byte at the end).
-    // """
-
-    // Let's trust the TXT record's length byte
-    // Worst case, it wastes 255 bytes
-    std::vector<char> recordAsString(txtLen + 1, '\0');
-    char* str = recordAsString.data();
-
-    memcpy(str, txtRecord + 1 /* skip the length byte */, txtLen);
-
-    // Check if it's the version key
-    static const char* versionKey = "v=";
-    size_t versionKeyLen = strlen(versionKey);
-
-    if (strncmp(versionKey, str, versionKeyLen)) return -1;
-
-    auto valueStart = str + versionKeyLen;
-
-    long parsedNumber = strtol(valueStart, 0, 10);
-
-    // No valid conversion. Also, 0
-    // is not a valid version.
-    if (!parsedNumber) return -1;
-
-    // Outside bounds of long.
-    if (parsedNumber == LONG_MIN || parsedNumber == LONG_MAX) return -1;
-
-    // Possibly valid version
-    return static_cast<int>(parsedNumber);
-}
-
-static void DNSSD_API register_resolved_mdns_service(
-        DNSServiceRef sdRef, DNSServiceFlags flags, uint32_t interfaceIndex,
-        DNSServiceErrorType errorCode, const char* fullname, const char* hosttarget, uint16_t port,
-        uint16_t txtLen, const unsigned char* txtRecord, void* context) {
-    D("Resolved a service.");
-    std::unique_ptr<DiscoveredService> discovered(
-        reinterpret_cast<DiscoveredService*>(context));
-
-    if (errorCode != kDNSServiceErr_NoError) {
-        D("Got error %d resolving service.", errorCode);
+void ForEachService(const std::unique_ptr<ServiceReceiver>& receiver,
+                    std::string_view wanted_instance_name, adb_secure_foreach_service_callback cb) {
+    if (!receiver->is_running()) {
         return;
     }
-
-    // TODO: Reject certain combinations of invalid or mismatched client and
-    // service versions here before creating anything.
-    // At the moment, there is nothing to reject, so accept everything
-    // as an optimistic default.
-    auto serviceVersion = parse_version_from_txt_record(txtLen, txtRecord);
-
-    auto resolved = new ResolvedService(discovered->ServiceName(), discovered->RegType(),
-                                        interfaceIndex, hosttarget, ntohs(port), serviceVersion);
-
-    if (! resolved->Initialized()) {
-        D("Unable to init resolved service");
-        delete resolved;
-    }
-
-    if (flags) { /* Only ever equals MoreComing or 0 */
-        D("releasing discovered service");
-        discovered.release();
+    auto services = receiver->GetServices();
+    for (const auto& s : services) {
+        if (wanted_instance_name.empty() || s.get().instance_name == wanted_instance_name) {
+            std::stringstream ss;
+            ss << s.get().v4_address;
+            cb(s.get().instance_name.c_str(), s.get().service_name.c_str(), ss.str().c_str(),
+               s.get().port);
+        }
     }
 }
 
-static void DNSSD_API on_service_browsed(DNSServiceRef sdRef, DNSServiceFlags flags,
-                                         uint32_t interfaceIndex, DNSServiceErrorType errorCode,
-                                         const char* serviceName, const char* regtype,
-                                         const char* domain, void* /*context*/) {
-    if (errorCode != kDNSServiceErr_NoError) {
-        D("Got error %d during mDNS browse.", errorCode);
-        DNSServiceRefDeallocate(sdRef);
-        int serviceIndex = adb_DNSServiceIndexByName(regtype);
-        if (serviceIndex != -1) {
-            fdevent_destroy(service_ref_fdes[serviceIndex]);
-        }
-        return;
+bool ConnectAdbSecureDevice(const MdnsInfo& info) {
+    if (!adb_wifi_is_known_host(info.service_name)) {
+        LOG(INFO) << "serviceName=" << info.service_name << " not in keystore";
+        return false;
     }
 
-    if (flags & kDNSServiceFlagsAdd) {
-        D("%s: Discover found new serviceName=[%s] regtype=[%s] domain=[%s]", __func__, serviceName,
-          regtype, domain);
-        auto discovered = new DiscoveredService(interfaceIndex, serviceName, regtype, domain);
-        if (!discovered->Initialized()) {
-            delete discovered;
-        }
-    } else {
-        D("%s: Discover lost serviceName=[%s] regtype=[%s] domain=[%s]", __func__, serviceName,
-          regtype, domain);
-        adb_RemoveDNSService(regtype, serviceName);
-    }
+    std::string response;
+    connect_device(android::base::StringPrintf("%s.%s", info.service_name.c_str(),
+                                               info.service_type.c_str()),
+                   &response);
+    D("Secure connect to %s regtype %s (%s:%hu) : %s", info.service_name.c_str(),
+      info.service_type.c_str(), info.addr.c_str(), info.port, response.c_str());
+    return true;
 }
 
-void init_mdns_transport_discovery_thread(void) {
-    int errorCodes[kNumADBDNSServices];
+}  // namespace
 
-    for (int i = 0; i < kNumADBDNSServices; ++i) {
-        errorCodes[i] = DNSServiceBrowse(&service_refs[i], 0, 0, kADBDNSServices[i], nullptr,
-                                         on_service_browsed, nullptr);
-
-        if (errorCodes[i] != kDNSServiceErr_NoError) {
-            D("Got %d browsing for mDNS service %s.", errorCodes[i], kADBDNSServices[i]);
-        }
-
-        if (errorCodes[i] == kDNSServiceErr_NoError) {
-            fdevent_run_on_main_thread([i]() {
-                service_ref_fdes[i] = fdevent_create(adb_DNSServiceRefSockFD(service_refs[i]),
-                                                     pump_service_ref, &service_refs[i]);
-                fdevent_set(service_ref_fdes[i], FDE_READ);
-            });
-        }
+/////////////////////////////////////////////////////////////////////////////////
+void mdns_cleanup() {
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.mdns_cleanup();
     }
 }
 
 void init_mdns_transport_discovery(void) {
-    ResolvedService::initAdbSecure();
-    std::thread(init_mdns_transport_discovery_thread).detach();
+    // TODO(joshuaduong): Use openscreen discovery by default for all platforms.
+    const char* mdns_osp = getenv("ADB_MDNS_OPENSCREEN");
+    if (mdns_osp && strcmp(mdns_osp, "1") == 0) {
+        LOG(INFO) << "Openscreen mdns discovery enabled";
+        StartDiscovery();
+    } else {
+        // Original behavior is to use Bonjour client.
+        g_using_bonjour = true;
+        g_adb_mdnsresponder_funcs = StartMdnsResponderDiscovery();
+    }
+}
+
+bool adb_secure_connect_by_service_name(const std::string& instance_name) {
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.adb_secure_connect_by_service_name(instance_name);
+    }
+
+    if (!g_state || g_state->receivers.empty()) {
+        LOG(INFO) << "Mdns not enabled";
+        return false;
+    }
+
+    std::optional<MdnsInfo> info;
+    auto cb = [&](const std::string& instance_name, const std::string& service_name,
+                  const std::string& ip_addr,
+                  uint16_t port) { info.emplace(instance_name, service_name, ip_addr, port); };
+    ForEachService(g_state->receivers[kADBSecureConnectServiceRefIndex], instance_name, cb);
+    if (info.has_value()) {
+        return ConnectAdbSecureDevice(*info);
+    }
+    return false;
+}
+
+std::string mdns_check() {
+    if (!g_state && !g_using_bonjour) {
+        return "ERROR: mdns discovery disabled";
+    }
+
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.mdns_check();
+    }
+
+    return "mdns daemon version [Openscreen discovery 0.0.0]";
+}
+
+std::string mdns_list_discovered_services() {
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.mdns_list_discovered_services();
+    }
+
+    if (!g_state || g_state->receivers.empty()) {
+        return "";
+    }
+
+    std::string result;
+    auto cb = [&](const std::string& instance_name, const std::string& service_name,
+                  const std::string& ip_addr, uint16_t port) {
+        result += android::base::StringPrintf("%s\t%s\t%s:%u\n", instance_name.data(),
+                                              service_name.data(), ip_addr.data(), port);
+    };
+
+    for (const auto& receiver : g_state->receivers) {
+        ForEachService(receiver, "", cb);
+    }
+    return result;
+}
+
+std::optional<MdnsInfo> mdns_get_connect_service_info(const std::string& name) {
+    CHECK(!name.empty());
+
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.mdns_get_connect_service_info(name);
+    }
+
+    if (!g_state || g_state->receivers.empty()) {
+        return std::nullopt;
+    }
+
+    auto mdns_instance = mdns::mdns_parse_instance_name(name);
+    if (!mdns_instance.has_value()) {
+        D("Failed to parse mDNS name [%s]", name.data());
+        return std::nullopt;
+    }
+
+    std::optional<MdnsInfo> info;
+    auto cb = [&](const std::string& instance_name, const std::string& service_name,
+                  const std::string& ip_addr,
+                  uint16_t port) { info.emplace(instance_name, service_name, ip_addr, port); };
+
+    std::string reg_type;
+    // Service name was provided.
+    if (!mdns_instance->service_name.empty()) {
+        reg_type = android::base::StringPrintf("%s.%s", mdns_instance->service_name.data(),
+                                               mdns_instance->transport_type.data());
+        const auto index = adb_DNSServiceIndexByName(reg_type);
+        if (!index) {
+            return std::nullopt;
+        }
+        switch (*index) {
+            case kADBTransportServiceRefIndex:
+            case kADBSecureConnectServiceRefIndex:
+                ForEachService(g_state->receivers[*index], mdns_instance->instance_name, cb);
+                break;
+            default:
+                D("Not a connectable service name [%s]", reg_type.data());
+                return std::nullopt;
+        }
+        return info;
+    }
+
+    // No mdns service name provided. Just search for the instance name in all adb connect services.
+    // Prefer the secured connect service over the other.
+    ForEachService(g_state->receivers[kADBSecureConnectServiceRefIndex], name, cb);
+    if (!info.has_value()) {
+        ForEachService(g_state->receivers[kADBTransportServiceRefIndex], name, cb);
+    }
+
+    return info;
+}
+
+std::optional<MdnsInfo> mdns_get_pairing_service_info(const std::string& name) {
+    CHECK(!name.empty());
+
+    if (g_using_bonjour) {
+        return g_adb_mdnsresponder_funcs.mdns_get_pairing_service_info(name);
+    }
+
+    if (!g_state || g_state->receivers.empty()) {
+        return std::nullopt;
+    }
+
+    auto mdns_instance = mdns::mdns_parse_instance_name(name);
+    if (!mdns_instance.has_value()) {
+        D("Failed to parse mDNS name [%s]", name.data());
+        return std::nullopt;
+    }
+
+    std::optional<MdnsInfo> info;
+    auto cb = [&](const std::string& instance_name, const std::string& service_name,
+                  const std::string& ip_addr,
+                  uint16_t port) { info.emplace(instance_name, service_name, ip_addr, port); };
+
+    std::string reg_type;
+    // Verify it's a pairing service if user explicitly inputs it.
+    if (!mdns_instance->service_name.empty()) {
+        reg_type = android::base::StringPrintf("%s.%s", mdns_instance->service_name.data(),
+                                               mdns_instance->transport_type.data());
+        const auto index = adb_DNSServiceIndexByName(reg_type);
+        if (!index) {
+            return std::nullopt;
+        }
+        switch (*index) {
+            case kADBSecurePairingServiceRefIndex:
+                break;
+            default:
+                D("Not an adb pairing reg_type [%s]", reg_type.data());
+                return std::nullopt;
+        }
+        return info;
+    }
+
+    ForEachService(g_state->receivers[kADBSecurePairingServiceRefIndex], name, cb);
+
+    return info;
 }

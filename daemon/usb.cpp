@@ -42,13 +42,16 @@
 
 #include <android-base/logging.h>
 #include <android-base/macros.h>
+#include <android-base/parsebool.h>
 #include <android-base/properties.h>
 #include <android-base/thread_annotations.h>
 
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
+#include "daemon/property_monitor.h"
 #include "daemon/usb_ffs.h"
 #include "sysdeps/chrono.h"
+#include "transfer_id.h"
 #include "transport.h"
 #include "types.h"
 
@@ -81,38 +84,6 @@ static const char* to_string(enum usb_functionfs_event_type type) {
             return "FUNCTIONFS_RESUME";
     }
 }
-
-enum class TransferDirection : uint64_t {
-    READ = 0,
-    WRITE = 1,
-};
-
-struct TransferId {
-    TransferDirection direction : 1;
-    uint64_t id : 63;
-
-    TransferId() : TransferId(TransferDirection::READ, 0) {}
-
-  private:
-    TransferId(TransferDirection direction, uint64_t id) : direction(direction), id(id) {}
-
-  public:
-    explicit operator uint64_t() const {
-        uint64_t result;
-        static_assert(sizeof(*this) == sizeof(result));
-        memcpy(&result, this, sizeof(*this));
-        return result;
-    }
-
-    static TransferId read(uint64_t id) { return TransferId(TransferDirection::READ, id); }
-    static TransferId write(uint64_t id) { return TransferId(TransferDirection::WRITE, id); }
-
-    static TransferId from_value(uint64_t value) {
-        TransferId result;
-        memcpy(&result, &value, sizeof(value));
-        return result;
-    }
-};
 
 template <class Payload>
 struct IoBlock {
@@ -525,15 +496,29 @@ struct UsbFfsConnection : public Connection {
             TransferId id = TransferId::from_value(event.data);
 
             if (event.res < 0) {
-                std::string error =
-                        StringPrintf("%s %" PRIu64 " failed with error %s",
-                                     id.direction == TransferDirection::READ ? "read" : "write",
-                                     id.id, strerror(-event.res));
-                HandleError(error);
-                return;
+                // On initial connection, some clients will send a ClearFeature(HALT) to
+                // attempt to resynchronize host and device after the adb server is killed.
+                // On newer device kernels, the reads we've already dispatched will be cancelled.
+                // Instead of treating this as a failure, which will tear down the interface and
+                // lead to the client doing the same thing again, just resubmit if this happens
+                // before we've actually read anything.
+                if (!connection_started_ && event.res == -EPIPE &&
+                    id.direction == TransferDirection::READ) {
+                    uint64_t read_idx = id.id % kUsbReadQueueDepth;
+                    SubmitRead(&read_requests_[read_idx]);
+                    continue;
+                } else {
+                    std::string error =
+                            StringPrintf("%s %" PRIu64 " failed with error %s",
+                                         id.direction == TransferDirection::READ ? "read" : "write",
+                                         id.id, strerror(-event.res));
+                    HandleError(error);
+                    return;
+                }
             }
 
             if (id.direction == TransferDirection::READ) {
+                connection_started_ = true;
                 if (!HandleRead(id, event.res)) {
                     return;
                 }
@@ -717,6 +702,7 @@ struct UsbFfsConnection : public Connection {
     unique_fd read_fd_;
     unique_fd write_fd_;
 
+    bool connection_started_ = false;
     std::optional<amessage> incoming_header_;
     IOVector incoming_payload_;
 
@@ -740,7 +726,27 @@ struct UsbFfsConnection : public Connection {
 static void usb_ffs_open_thread() {
     adb_thread_setname("usb ffs open");
 
+    // When the device is acting as a USB host, we'll be unable to bind to the USB gadget on kernels
+    // that don't carry a downstream patch to enable that behavior.
+    //
+    // This property is copied from vendor.sys.usb.adb.disabled by an init.rc script.
+    //
+    // Note that this property only disables rebinding the USB gadget: setting it while an interface
+    // is already bound will do nothing.
+    static const char* kPropertyUsbDisabled = "sys.usb.adb.disabled";
+    PropertyMonitor prop_mon;
+    prop_mon.Add(kPropertyUsbDisabled, [](std::string value) {
+        // Return false (i.e. break out of PropertyMonitor::Run) when the property != 1.
+        return android::base::ParseBool(value) == android::base::ParseBoolResult::kTrue;
+    });
+
     while (true) {
+        if (android::base::GetBoolProperty(kPropertyUsbDisabled, false)) {
+            LOG(INFO) << "pausing USB due to " << kPropertyUsbDisabled;
+            prop_mon.Run();
+            LOG(INFO) << "resuming USB";
+        }
+
         unique_fd control;
         unique_fd bulk_out;
         unique_fd bulk_in;
