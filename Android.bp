@@ -12,6 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    default_applicable_licenses: ["packages_modules_adb_license"],
+}
+
+// Added automatically by a large-scale-change
+// See: http://go/android-license-faq
+license {
+    name: "packages_modules_adb_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+    ],
+    license_text: [
+        "NOTICE",
+    ],
+}
+
+tidy_errors = [
+    "-*",
+    "bugprone-inaccurate-erase",
+    "bugprone-use-after-move",
+]
+
 cc_defaults {
     name: "adb_defaults",
 
@@ -20,6 +43,7 @@ cc_defaults {
         "-Wextra",
         "-Werror",
         "-Wexit-time-destructors",
+        "-Wno-non-virtual-dtor",
         "-Wno-unused-parameter",
         "-Wno-missing-field-initializers",
         "-Wthread-safety",
@@ -39,6 +63,10 @@ cc_defaults {
                 "-framework CoreFoundation",
                 "-framework IOKit",
                 "-lobjc",
+            ],
+            cflags: [
+                // Required, to use the new IPv6 Sockets options introduced by RFC 3542.
+                "-D__APPLE_USE_RFC_3542",
             ],
         },
 
@@ -70,9 +98,14 @@ cc_defaults {
                 "-lws2_32",
                 "-lgdi32",
                 "-luserenv",
+                "-liphlpapi",
             ],
         },
     },
+
+    tidy: true,
+    tidy_checks: tidy_errors,
+    tidy_checks_as_errors: tidy_errors,
 }
 
 cc_defaults {
@@ -103,35 +136,63 @@ cc_defaults {
     },
 }
 
-cc_defaults {
+soong_config_module_type_import {
+    from: "system/apex/Android.bp",
+    module_types: ["library_linking_strategy_cc_defaults"],
+}
+
+library_linking_strategy_cc_defaults {
     name: "libadbd_binary_dependencies",
     static_libs: [
         "libadb_crypto",
         "libadb_pairing_connection",
+        "libadb_sysdeps",
         "libadb_tls_connection",
         "libadbd",
         "libadbd_core",
         "libadbconnection_server",
         "libasyncio",
         "libbrotli",
+        "libcrypto_utils",
         "libcutils_sockets",
         "libdiagnose_usb",
         "libmdnssd",
-        "libbase",
+        "libzstd",
 
         "libadb_protos",
+        "libapp_processes_protos_lite",
+        "libprotobuf-cpp-lite",
     ],
 
     shared_libs: [
         "libadbd_auth",
         "libadbd_fs",
-        "libcrypto",
-        "libcrypto_utils",
         "liblog",
         "libselinux",
     ],
 
+    soong_config_variables:{
+        library_linking_strategy: {
+            prefer_static: {
+                static_libs: [
+                    "libbase",
+                ],
+            },
+            conditions_default: {
+                shared_libs: [
+                    "libbase",
+                ],
+            },
+        },
+    },
+
     target: {
+        android: {
+            shared_libs: ["libcrypto"],
+        },
+        linux_glibc: {
+            static_libs: ["libcrypto_static"],
+        },
         recovery: {
             exclude_static_libs: [
                 "libadb_pairing_auth",
@@ -148,19 +209,30 @@ libadb_srcs = [
     "adb.cpp",
     "adb_io.cpp",
     "adb_listeners.cpp",
+    "adb_mdns.cpp",
     "adb_trace.cpp",
     "adb_unique_fd.cpp",
     "adb_utils.cpp",
     "fdevent/fdevent.cpp",
-    "fdevent/fdevent_poll.cpp",
     "services.cpp",
     "sockets.cpp",
     "socket_spec.cpp",
+    "sysdeps/env.cpp",
     "sysdeps/errno.cpp",
     "transport.cpp",
     "transport_fd.cpp",
-    "transport_local.cpp",
     "types.cpp",
+]
+
+libadb_darwin_srcs = [
+    "fdevent/fdevent_poll.cpp",
+]
+
+libadb_windows_srcs = [
+    "fdevent/fdevent_poll.cpp",
+    "sysdeps_win32.cpp",
+    "sysdeps/win32/errno.cpp",
+    "sysdeps/win32/stat.cpp",
 ]
 
 libadb_posix_srcs = [
@@ -190,10 +262,17 @@ cc_library_host_static {
     defaults: ["adb_defaults"],
 
     srcs: libadb_srcs + [
+        "client/openscreen/mdns_service_info.cpp",
+        "client/openscreen/mdns_service_watcher.cpp",
+        "client/openscreen/platform/logging.cpp",
+        "client/openscreen/platform/task_runner.cpp",
+        "client/openscreen/platform/udp_socket.cpp",
         "client/auth.cpp",
         "client/adb_wifi.cpp",
         "client/usb_libusb.cpp",
-        "client/usb_dispatch.cpp",
+        "client/transport_local.cpp",
+        "client/mdnsresponder_client.cpp",
+        "client/mdns_utils.cpp",
         "client/transport_mdns.cpp",
         "client/transport_usb.cpp",
         "client/pairing/pairing_client.cpp",
@@ -206,7 +285,7 @@ cc_library_host_static {
             srcs: ["client/usb_linux.cpp"] + libadb_linux_srcs,
         },
         darwin: {
-            srcs: ["client/usb_osx.cpp"],
+            srcs: ["client/usb_osx.cpp"] + libadb_darwin_srcs,
         },
         not_windows: {
             srcs: libadb_posix_srcs,
@@ -215,10 +294,7 @@ cc_library_host_static {
             enabled: true,
             srcs: [
                 "client/usb_windows.cpp",
-                "sysdeps_win32.cpp",
-                "sysdeps/win32/errno.cpp",
-                "sysdeps/win32/stat.cpp",
-            ],
+            ] + libadb_windows_srcs,
             shared_libs: ["AdbWinApi"],
         },
     },
@@ -237,20 +313,65 @@ cc_library_host_static {
         "libutils",
         "liblog",
         "libcutils",
+        "libopenscreen-discovery",
+        "libopenscreen-platform-impl",
         "libprotobuf-cpp-lite",
+    ],
+}
+
+cc_library {
+    name: "libadb_sysdeps",
+    defaults: ["adb_defaults"],
+    recovery_available: true,
+    host_supported: true,
+    compile_multilib: "both",
+    min_sdk_version: "apex_inherit",
+    // This library doesn't use build::GetBuildNumber()
+    use_version_lib: false,
+
+    srcs: [
+        "sysdeps/env.cpp",
+    ],
+
+    shared_libs: [
+        "libbase",
+        "liblog",
+    ],
+
+    target: {
+        windows: {
+            enabled: true,
+            ldflags: ["-municode"],
+        },
+    },
+
+    export_include_dirs: ["."],
+
+    visibility: [
+        "//bootable/recovery/minadbd:__subpackages__",
+        "//packages/modules/adb:__subpackages__",
+    ],
+
+    apex_available: [
+        "com.android.adbd",
+        "test_com.android.adbd",
     ],
 }
 
 cc_test_host {
     name: "adb_test",
     defaults: ["adb_defaults"],
-    srcs: libadb_test_srcs,
+    srcs: libadb_test_srcs + [
+        "client/mdns_utils_test.cpp",
+    ],
+
     static_libs: [
         "libadb_crypto_static",
         "libadb_host",
         "libadb_pairing_auth_static",
         "libadb_pairing_connection_static",
         "libadb_protos_static",
+        "libadb_sysdeps",
         "libadb_tls_connection_static",
         "libbase",
         "libcutils",
@@ -259,6 +380,8 @@ cc_test_host {
         "liblog",
         "libmdnssd",
         "libdiagnose_usb",
+        "libopenscreen-discovery",
+        "libopenscreen-platform-impl",
         "libprotobuf-cpp-lite",
         "libssl",
         "libusb",
@@ -304,11 +427,13 @@ cc_binary_host {
     static_libs: [
         "libadb_crypto",
         "libadb_host",
-	"libadb_pairing_auth",
-	"libadb_pairing_connection",
+        "libadb_pairing_auth",
+        "libadb_pairing_connection",
         "libadb_protos",
+        "libadb_sysdeps",
         "libadb_tls_connection",
         "libandroidfw",
+        "libapp_processes_protos_full",
         "libbase",
         "libbrotli",
         "libcutils",
@@ -319,13 +444,16 @@ cc_binary_host {
         "liblog",
         "liblz4",
         "libmdnssd",
-        "libprotobuf-cpp-lite",
+        "libopenscreen-discovery",
+        "libopenscreen-platform-impl",
+        "libprotobuf-cpp-full",
         "libssl",
         "libusb",
         "libutils",
         "liblog",
         "libziparchive",
         "libz",
+        "libzstd",
     ],
 
     // Don't add anything here, we don't want additional shared dependencies
@@ -369,25 +497,27 @@ cc_library_static {
     compile_multilib: "both",
 
     srcs: libadb_srcs + libadb_linux_srcs + libadb_posix_srcs + [
+        "daemon/adb_wifi.cpp",
         "daemon/auth.cpp",
         "daemon/jdwp_service.cpp",
         "daemon/logging.cpp",
-        "daemon/adb_wifi.cpp",
+        "daemon/transport_local.cpp",
     ],
 
     generated_headers: ["platform_tools_version"],
 
     static_libs: [
-        "libadbconnection_server",
         "libdiagnose_usb",
     ],
 
     shared_libs: [
+        "libadbconnection_server",
         "libadb_crypto",
         "libadb_pairing_connection",
         "libadb_protos",
         "libadb_tls_connection",
         "libadbd_auth",
+        "libapp_processes_protos_lite",
         "libasyncio",
         "libbase",
         "libcrypto",
@@ -396,21 +526,26 @@ cc_library_static {
         "liblog",
     ],
 
+    proto: {
+        type: "lite",
+        static: true,
+        export_proto_headers: true,
+    },
+
     target: {
         android: {
-            whole_static_libs: [
-                "libqemu_pipe",
-            ],
             srcs: [
-                "daemon/transport_qemu.cpp",
+                "daemon/property_monitor.cpp",
                 "daemon/usb.cpp",
                 "daemon/usb_ffs.cpp",
+                "daemon/watchdog.cpp",
             ]
         },
         recovery: {
             exclude_shared_libs: [
                 "libadb_pairing_auth",
                 "libadb_pairing_connection",
+                "libapp_processes_protos_lite",
             ],
         }
     },
@@ -448,6 +583,8 @@ cc_library {
         "libadbd_core",
         "libbrotli",
         "libdiagnose_usb",
+        "liblz4",
+        "libzstd",
     ],
 
     shared_libs: [
@@ -455,10 +592,12 @@ cc_library {
         "libadb_pairing_connection",
         "libadb_protos",
         "libadb_tls_connection",
+        "libapp_processes_protos_lite",
         "libasyncio",
         "libbase",
         "libcrypto_utils",
         "libcutils_sockets",
+        "libprotobuf-cpp-lite",
 
         // APEX dependencies.
         "libadbd_auth",
@@ -514,6 +653,9 @@ cc_library {
     compile_multilib: "both",
 
     shared_libs: [
+        "libadbconnection_server",
+        "libapp_processes_protos_lite",
+        "libprotobuf-cpp-lite",
         "libadb_crypto",
         "libadb_pairing_connection",
         "libadb_tls_connection",
@@ -544,12 +686,14 @@ cc_library {
         "libbrotli",
         "libcutils_sockets",
         "libdiagnose_usb",
+        "liblz4",
         "libmdnssd",
+        "libzstd",
     ],
 
     visibility: [
         "//bootable/recovery/minadbd",
-	"//packages/modules/adb",
+        "//packages/modules/adb",
     ],
 }
 
@@ -577,6 +721,7 @@ cc_binary {
         "libadbd_services",
         "libasyncio",
         "libcap",
+        "liblz4",
         "libminijail",
         "libssl",
     ],
@@ -669,6 +814,14 @@ cc_test {
 
     test_config: "adb_test.xml",
 
+    target: {
+        android: {
+            srcs: [
+                "daemon/property_monitor_test.cpp",
+            ],
+        },
+    },
+
     shared_libs: [
         "liblog",
     ],
@@ -680,7 +833,7 @@ cc_test {
         "libcrypto_utils",
         "libusb",
     ],
-    test_suites: ["device-tests", "mts-adbd"],
+    test_suites: ["general-tests", "mts-adbd"],
     require_root: true,
 }
 
@@ -699,6 +852,9 @@ python_test_host {
         py3: {
             enabled: true,
         },
+    },
+    test_options: {
+        unit_test: false,
     },
 }
 
@@ -720,6 +876,9 @@ python_test_host {
         py3: {
             enabled: true,
         },
+    },
+    test_options: {
+        unit_test: false,
     },
 }
 
@@ -789,6 +948,7 @@ cc_test_host {
         "libadb_pairing_auth_static",
         "libadb_pairing_connection_static",
         "libadb_protos_static",
+        "libadb_sysdeps",
         "libadb_tls_connection_static",
         "libandroidfw",
         "libbase",
@@ -799,6 +959,8 @@ cc_test_host {
         "libfastdeploy_host",
         "liblog",
         "libmdnssd",
+        "libopenscreen-discovery",
+        "libopenscreen-platform-impl",
         "libprotobuf-cpp-lite",
         "libssl",
         "libusb",
