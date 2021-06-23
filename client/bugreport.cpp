@@ -104,7 +104,9 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
             SetLineMessage("pulling");
             status_ =
                 br_->DoSyncPull(srcs, destination.c_str(), false, line_message_.c_str()) ? 0 : 1;
-            if (status_ != 0) {
+            if (status_ == 0) {
+                printf("Bug report copied to %s\n", destination.c_str());
+            } else {
                 fprintf(stderr,
                         "Bug report finished but could not be copied to '%s'.\n"
                         "Try to run 'adb pull %s <directory>'\n"
@@ -197,7 +199,7 @@ class BugreportStandardStreamsCallback : public StandardStreamsCallbackInterface
 };
 
 int Bugreport::DoIt(int argc, const char** argv) {
-    if (argc > 2) error_exit("usage: adb bugreport [PATH]");
+    if (argc > 2) error_exit("usage: adb bugreport [[PATH] | [--stream]]");
 
     // Gets bugreportz version.
     std::string bugz_stdout, bugz_stderr;
@@ -205,6 +207,7 @@ int Bugreport::DoIt(int argc, const char** argv) {
     int status = SendShellCommand("bugreportz -v", false, &version_callback);
     std::string bugz_version = android::base::Trim(bugz_stderr);
     std::string bugz_output = android::base::Trim(bugz_stdout);
+    int bugz_ver_major = 0, bugz_ver_minor = 0;
 
     if (status != 0 || bugz_version.empty()) {
         D("'bugreportz' -v results: status=%d, stdout='%s', stderr='%s'", status,
@@ -222,10 +225,12 @@ int Bugreport::DoIt(int argc, const char** argv) {
         // 'bugreport' would generate a lot of output the user might not be prepared to handle).
         fprintf(stderr,
                 "Failed to get bugreportz version: 'bugreportz -v' returned '%s' (code %d).\n"
-                "If the device does not run Android 7.0 or above, try 'adb bugreport' instead.\n",
+                "If the device does not run Android 7.0 or above, try this instead:\n"
+                "\tadb bugreport > bugreport.txt\n",
                 bugz_output.c_str(), status);
         return status != 0 ? status : -1;
     }
+    std::sscanf(bugz_version.c_str(), "%d.%d", &bugz_ver_major, &bugz_ver_minor);
 
     std::string dest_file, dest_dir;
 
@@ -234,6 +239,13 @@ int Bugreport::DoIt(int argc, const char** argv) {
         if (!getcwd(&dest_dir)) {
             perror("adb: getcwd failed");
             return 1;
+        }
+    } else if (!strcmp(argv[1], "--stream")) {
+        if (bugz_ver_major == 1 && bugz_ver_minor < 2) {
+            fprintf(stderr,
+                    "Failed to stream bugreport: bugreportz does not support stream.\n");
+        } else {
+            return SendShellCommand("bugreportz -s", false);
         }
     } else {
         // Check whether argument is a directory or file
@@ -282,5 +294,5 @@ int Bugreport::SendShellCommand(const std::string& command, bool disable_shell_p
 
 bool Bugreport::DoSyncPull(const std::vector<const char*>& srcs, const char* dst, bool copy_attrs,
                            const char* name) {
-    return do_sync_pull(srcs, dst, copy_attrs, name);
+    return do_sync_pull(srcs, dst, copy_attrs, CompressionType::None, name);
 }
