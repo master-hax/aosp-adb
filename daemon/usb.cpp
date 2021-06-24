@@ -51,6 +51,7 @@
 #include "daemon/property_monitor.h"
 #include "daemon/usb_ffs.h"
 #include "sysdeps/chrono.h"
+#include "transfer_id.h"
 #include "transport.h"
 #include "types.h"
 
@@ -83,38 +84,6 @@ static const char* to_string(enum usb_functionfs_event_type type) {
             return "FUNCTIONFS_RESUME";
     }
 }
-
-enum class TransferDirection : uint64_t {
-    READ = 0,
-    WRITE = 1,
-};
-
-struct TransferId {
-    TransferDirection direction : 1;
-    uint64_t id : 63;
-
-    TransferId() : TransferId(TransferDirection::READ, 0) {}
-
-  private:
-    TransferId(TransferDirection direction, uint64_t id) : direction(direction), id(id) {}
-
-  public:
-    explicit operator uint64_t() const {
-        uint64_t result;
-        static_assert(sizeof(*this) == sizeof(result));
-        memcpy(&result, this, sizeof(*this));
-        return result;
-    }
-
-    static TransferId read(uint64_t id) { return TransferId(TransferDirection::READ, id); }
-    static TransferId write(uint64_t id) { return TransferId(TransferDirection::WRITE, id); }
-
-    static TransferId from_value(uint64_t value) {
-        TransferId result;
-        memcpy(&result, &value, sizeof(value));
-        return result;
-    }
-};
 
 template <class Payload>
 struct IoBlock {
@@ -527,15 +496,29 @@ struct UsbFfsConnection : public Connection {
             TransferId id = TransferId::from_value(event.data);
 
             if (event.res < 0) {
-                std::string error =
-                        StringPrintf("%s %" PRIu64 " failed with error %s",
-                                     id.direction == TransferDirection::READ ? "read" : "write",
-                                     id.id, strerror(-event.res));
-                HandleError(error);
-                return;
+                // On initial connection, some clients will send a ClearFeature(HALT) to
+                // attempt to resynchronize host and device after the adb server is killed.
+                // On newer device kernels, the reads we've already dispatched will be cancelled.
+                // Instead of treating this as a failure, which will tear down the interface and
+                // lead to the client doing the same thing again, just resubmit if this happens
+                // before we've actually read anything.
+                if (!connection_started_ && event.res == -EPIPE &&
+                    id.direction == TransferDirection::READ) {
+                    uint64_t read_idx = id.id % kUsbReadQueueDepth;
+                    SubmitRead(&read_requests_[read_idx]);
+                    continue;
+                } else {
+                    std::string error =
+                            StringPrintf("%s %" PRIu64 " failed with error %s",
+                                         id.direction == TransferDirection::READ ? "read" : "write",
+                                         id.id, strerror(-event.res));
+                    HandleError(error);
+                    return;
+                }
             }
 
             if (id.direction == TransferDirection::READ) {
+                connection_started_ = true;
                 if (!HandleRead(id, event.res)) {
                     return;
                 }
@@ -599,7 +582,7 @@ struct UsbFfsConnection : public Connection {
 
                 // TODO: Make apacket contain an IOVector so we don't have to coalesce.
                 packet->payload = std::move(incoming_payload_).coalesce();
-                read_callback_(this, std::move(packet));
+                transport_->HandleRead(std::move(packet));
 
                 incoming_header_.reset();
                 // reuse the capacity of the incoming payload while we can.
@@ -695,7 +678,10 @@ struct UsbFfsConnection : public Connection {
 
     void HandleError(const std::string& error) {
         std::call_once(error_flag_, [&]() {
-            error_callback_(this, error);
+            if (transport_) {
+                transport_->HandleError(error);
+            }
+
             if (!stopped_) {
                 Stop();
             }
@@ -719,6 +705,7 @@ struct UsbFfsConnection : public Connection {
     unique_fd read_fd_;
     unique_fd write_fd_;
 
+    bool connection_started_ = false;
     std::optional<amessage> incoming_header_;
     IOVector incoming_payload_;
 
@@ -757,18 +744,18 @@ static void usb_ffs_open_thread() {
     });
 
     while (true) {
-        if (android::base::GetBoolProperty(kPropertyUsbDisabled, false)) {
-            LOG(INFO) << "pausing USB due to " << kPropertyUsbDisabled;
-            prop_mon.Run();
-            LOG(INFO) << "resuming USB";
-        }
-
         unique_fd control;
         unique_fd bulk_out;
         unique_fd bulk_in;
         if (!open_functionfs(&control, &bulk_out, &bulk_in)) {
             std::this_thread::sleep_for(1s);
             continue;
+        }
+
+        if (android::base::GetBoolProperty(kPropertyUsbDisabled, false)) {
+            LOG(INFO) << "pausing USB due to " << kPropertyUsbDisabled;
+            prop_mon.Run();
+            LOG(INFO) << "resuming USB";
         }
 
         atransport* transport = new atransport();

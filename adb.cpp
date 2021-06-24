@@ -1260,6 +1260,14 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
             return HostRequestResult::Handled;
         }
 
+        // Mdns instance named device
+        atransport* t = find_transport(address.c_str());
+        if (t != nullptr) {
+            kick_transport(t);
+            SendOkay(reply_fd, android::base::StringPrintf("disconnected %s", address.c_str()));
+            return HostRequestResult::Handled;
+        }
+
         std::string serial;
         std::string host;
         int port = DEFAULT_ADB_LOCAL_TRANSPORT_PORT;
@@ -1271,7 +1279,7 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
                                                            address.c_str(), error.c_str()));
             return HostRequestResult::Handled;
         }
-        atransport* t = find_transport(serial.c_str());
+        t = find_transport(serial.c_str());
         if (t == nullptr) {
             SendFail(reply_fd, android::base::StringPrintf("no such device '%s'", serial.c_str()));
             return HostRequestResult::Handled;
@@ -1349,6 +1357,52 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
                     "reconnecting " + t->serial_name() + " [" + t->connection_state_name() + "]\n";
         }
         SendOkay(reply_fd, response);
+        return HostRequestResult::Handled;
+    }
+
+    if (service == "attach") {
+        std::string error;
+        atransport* t = s->transport ? s->transport
+                                     : acquire_one_transport(type, serial, transport_id, nullptr,
+                                                             &error, true);
+        if (!t) {
+            SendFail(reply_fd, error);
+            return HostRequestResult::Handled;
+        }
+
+        if (t->Attach(&error)) {
+            SendOkay(reply_fd,
+                     android::base::StringPrintf("%s attached", t->serial_name().c_str()));
+        } else {
+            SendFail(reply_fd, error);
+        }
+        return HostRequestResult::Handled;
+    }
+
+    if (service == "detach") {
+        std::string error;
+        atransport* t = s->transport ? s->transport
+                                     : acquire_one_transport(type, serial, transport_id, nullptr,
+                                                             &error, true);
+        if (!t) {
+            SendFail(reply_fd, error);
+            return HostRequestResult::Handled;
+        }
+
+        // HACK:
+        // Detaching the transport will lead to all of its sockets being closed,
+        // but we're handling one of those sockets right now!
+        //
+        // Mark the socket as not having a transport, knowing that it'll be cleaned up by the
+        // function that called us.
+        s->transport = nullptr;
+
+        if (t->Detach(&error)) {
+            SendOkay(reply_fd,
+                     android::base::StringPrintf("%s detached", t->serial_name().c_str()));
+        } else {
+            SendFail(reply_fd, error);
+        }
         return HostRequestResult::Handled;
     }
 

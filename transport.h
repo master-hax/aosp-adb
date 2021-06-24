@@ -106,22 +106,7 @@ struct Connection {
     Connection() = default;
     virtual ~Connection() = default;
 
-    void SetTransportName(std::string transport_name) {
-        transport_name_ = std::move(transport_name);
-    }
-
-    using ReadCallback = std::function<bool(Connection*, std::unique_ptr<apacket>)>;
-    void SetReadCallback(ReadCallback callback) {
-        CHECK(!read_callback_);
-        read_callback_ = callback;
-    }
-
-    // Called after the Connection has terminated, either by an error or because Stop was called.
-    using ErrorCallback = std::function<void(Connection*, const std::string&)>;
-    void SetErrorCallback(ErrorCallback callback) {
-        CHECK(!error_callback_);
-        error_callback_ = callback;
-    }
+    void SetTransport(atransport* transport) { transport_ = transport; }
 
     virtual bool Write(std::unique_ptr<apacket> packet) = 0;
 
@@ -133,9 +118,19 @@ struct Connection {
     // Stop, and reset the device if it's a USB connection.
     virtual void Reset();
 
-    std::string transport_name_;
-    ReadCallback read_callback_;
-    ErrorCallback error_callback_;
+    virtual bool Attach(std::string* error) {
+        *error = "transport type doesn't support attach";
+        return false;
+    }
+
+    virtual bool Detach(std::string* error) {
+        *error = "transport type doesn't support detach";
+        return false;
+    }
+
+    std::string Serial() const;
+
+    atransport* transport_ = nullptr;
 
     static std::unique_ptr<Connection> FromFd(unique_fd fd);
 };
@@ -289,11 +284,14 @@ class atransport : public enable_weak_from_this<atransport> {
     ConnectionState GetConnectionState() const;
     void SetConnectionState(ConnectionState state);
 
-    void SetConnection(std::unique_ptr<Connection> connection);
+    void SetConnection(std::shared_ptr<Connection> connection);
     std::shared_ptr<Connection> connection() {
         std::lock_guard<std::mutex> lock(mutex_);
         return connection_;
     }
+
+    bool HandleRead(std::unique_ptr<apacket> p);
+    void HandleError(const std::string& error);
 
 #if ADB_HOST
     void SetUsbHandle(usb_handle* h) { usb_handle_ = h; }
@@ -343,9 +341,7 @@ class atransport : public enable_weak_from_this<atransport> {
     int get_protocol_version() const;
     size_t get_max_payload() const;
 
-    const FeatureSet& features() const {
-        return features_;
-    }
+    const FeatureSet& features() const { return features_; }
 
     bool has_feature(const std::string& feature) const;
 
@@ -355,6 +351,11 @@ class atransport : public enable_weak_from_this<atransport> {
     void AddDisconnect(adisconnect* disconnect);
     void RemoveDisconnect(adisconnect* disconnect);
     void RunDisconnects();
+
+#if ADB_HOST
+    bool Attach(std::string* error);
+    bool Detach(std::string* error);
+#endif
 
 #if ADB_HOST
     // Returns true if |target| matches this transport. A matching |target| can be any of:
@@ -463,6 +464,9 @@ void register_transport(atransport* transport);
 
 #if ADB_HOST
 void init_usb_transport(atransport* t, usb_handle* usb);
+
+void register_usb_transport(std::shared_ptr<Connection> connection, const char* serial,
+                            const char* devpath, unsigned writeable);
 void register_usb_transport(usb_handle* h, const char* serial, const char* devpath,
                             unsigned writeable);
 
@@ -493,4 +497,4 @@ void server_socket_thread(std::function<unique_fd(std::string_view, std::string*
                           std::string_view addr);
 #endif
 
-#endif   /* __TRANSPORT_H */
+#endif /* __TRANSPORT_H */
