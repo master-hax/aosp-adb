@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "packages_modules_adb_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["packages_modules_adb_license"],
+}
+
 cc_defaults {
     name: "libadb_pairing_connection_defaults",
     cflags: [
@@ -40,7 +49,7 @@ cc_defaults {
     visibility: [
         "//art:__subpackages__",
         "//frameworks/base/services:__subpackages__",
-	"//packages/modules/adb:__subpackages__",
+        "//packages/modules/adb:__subpackages__",
 
         // This needs to be visible to minadbd, even though it's removed via exclude_shared_libs.
         "//bootable/recovery/minadbd:__subpackages__",
@@ -84,7 +93,7 @@ cc_library {
     static_libs: [
         "libadb_protos",
         // Statically link libadb_tls_connection because it is not
-	// ABI-stable.
+        // ABI-stable.
         "libadb_tls_connection",
         "libprotobuf-cpp-lite",
     ],
@@ -133,7 +142,6 @@ cc_defaults {
         "//packages/modules/adb:__subpackages__",
     ],
 
-    host_supported: true,
     recovery_available: false,
 
     stl: "libc++_static",
