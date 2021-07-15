@@ -31,7 +31,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
+#include <vector>
 
 #include <android-base/macros.h>
 #include <android-base/thread_annotations.h>
@@ -41,7 +41,10 @@
 #include "adb_unique_fd.h"
 #include "types.h"
 
-typedef std::unordered_set<std::string> FeatureSet;
+// Even though the feature set is used as a set, we only have a dozen or two
+// of available features at any moment. Vector works much better in terms of
+// both memory usage and performance for these sizes.
+using FeatureSet = std::vector<std::string>;
 
 namespace adb {
 namespace tls {
@@ -83,10 +86,18 @@ extern const char* const kFeatureAbbExec;
 extern const char* const kFeatureFixedPushSymlinkTimestamp;
 // Implement `adb remount` via shelling out to /system/bin/remount.
 extern const char* const kFeatureRemountShell;
+// adbd supports `track-app` service reporting debuggable/profileable apps.
+extern const char* const kFeatureTrackApp;
 // adbd supports version 2 of send/recv.
 extern const char* const kFeatureSendRecv2;
 // adbd supports brotli for send/recv v2.
 extern const char* const kFeatureSendRecv2Brotli;
+// adbd supports LZ4 for send/recv v2.
+extern const char* const kFeatureSendRecv2LZ4;
+// adbd supports Zstd for send/recv v2.
+extern const char* const kFeatureSendRecv2Zstd;
+// adbd supports dry-run send for send/recv v2.
+extern const char* const kFeatureSendRecv2DryRunSend;
 
 TransportId NextTransportId();
 
@@ -254,9 +265,12 @@ class atransport : public enable_weak_from_this<atransport> {
         : id(NextTransportId()),
           kicked_(false),
           connection_state_(state),
-          connection_waitable_(std::make_shared<ConnectionWaitable>()),
           connection_(nullptr),
           reconnect_(std::move(reconnect)) {
+#if ADB_HOST
+        connection_waitable_ = std::make_shared<ConnectionWaitable>();
+#endif
+
         // Initialize protocol to min version for compatibility with older versions.
         // Version will be updated post-connect.
         protocol_version = A_VERSION_MIN;
@@ -275,7 +289,7 @@ class atransport : public enable_weak_from_this<atransport> {
     ConnectionState GetConnectionState() const;
     void SetConnectionState(ConnectionState state);
 
-    void SetConnection(std::unique_ptr<Connection> connection);
+    void SetConnection(std::shared_ptr<Connection> connection);
     std::shared_ptr<Connection> connection() {
         std::lock_guard<std::mutex> lock(mutex_);
         return connection_;
@@ -329,9 +343,7 @@ class atransport : public enable_weak_from_this<atransport> {
     int get_protocol_version() const;
     size_t get_max_payload() const;
 
-    const FeatureSet& features() const {
-        return features_;
-    }
+    const FeatureSet& features() const { return features_; }
 
     bool has_feature(const std::string& feature) const;
 
@@ -342,6 +354,7 @@ class atransport : public enable_weak_from_this<atransport> {
     void RemoveDisconnect(adisconnect* disconnect);
     void RunDisconnects();
 
+#if ADB_HOST
     // Returns true if |target| matches this transport. A matching |target| can be any of:
     //   * <serial>
     //   * <devpath>
@@ -366,6 +379,7 @@ class atransport : public enable_weak_from_this<atransport> {
 
     // Attempts to reconnect with the underlying Connection.
     ReconnectResult Reconnect();
+#endif
 
   private:
     std::atomic<bool> kicked_;
@@ -384,9 +398,11 @@ class atransport : public enable_weak_from_this<atransport> {
     std::deque<std::shared_ptr<RSA>> keys_;
 #endif
 
+#if ADB_HOST
     // A sharable object that can be used to wait for the atransport's
     // connection to be established.
     std::shared_ptr<ConnectionWaitable> connection_waitable_;
+#endif
 
     // The underlying connection object.
     std::shared_ptr<Connection> connection_ GUARDED_BY(mutex_);
@@ -426,10 +442,17 @@ void init_reconnect_handler(void);
 void init_transport_registration(void);
 void init_mdns_transport_discovery(void);
 std::string list_transports(bool long_listing);
+
+#if ADB_HOST
 atransport* find_transport(const char* serial);
+
 void kick_all_tcp_devices();
+#endif
+
 void kick_all_transports();
+
 void kick_all_tcp_tls_transports();
+
 #if !ADB_HOST
 void kick_all_transports_by_auth_key(std::string_view auth_key);
 #endif
@@ -438,6 +461,9 @@ void register_transport(atransport* transport);
 
 #if ADB_HOST
 void init_usb_transport(atransport* t, usb_handle* usb);
+
+void register_usb_transport(std::shared_ptr<Connection> connection, const char* serial,
+                            const char* devpath, unsigned writeable);
 void register_usb_transport(usb_handle* h, const char* serial, const char* devpath,
                             unsigned writeable);
 
@@ -466,12 +492,6 @@ asocket* create_device_tracker(bool long_output);
 unique_fd adb_listen(std::string_view addr, std::string* error);
 void server_socket_thread(std::function<unique_fd(std::string_view, std::string*)> listen_func,
                           std::string_view addr);
-
-#if defined(__ANDROID__)
-void qemu_socket_thread(std::string_view addr);
-bool use_qemu_goldfish();
 #endif
 
-#endif
-
-#endif   /* __TRANSPORT_H */
+#endif /* __TRANSPORT_H */
