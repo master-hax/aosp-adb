@@ -28,6 +28,7 @@
 
 #include "adb_auth.h"
 #include "adb_known_hosts.pb.h"
+#include "adb_mdns.h"
 #include "adb_utils.h"
 #include "client/adb_client.h"
 #include "sysdeps.h"
@@ -179,17 +180,21 @@ bool adb_wifi_is_known_host(const std::string& host) {
 
 void adb_wifi_pair_device(const std::string& host, const std::string& password,
                           std::string& response) {
-    // Check the address for a valid address and port.
-    std::string parsed_host;
-    std::string err;
-    int port = -1;
-    if (!android::base::ParseNetAddress(host, &parsed_host, &port, nullptr, &err)) {
-        response = "Failed to parse address for pairing: " + err;
-        return;
-    }
-    if (port <= 0 || port > 65535) {
-        response = "Invalid port while parsing address [" + host + "]";
-        return;
+    auto mdns_info = mdns_get_pairing_service_info(host);
+
+    if (!mdns_info.has_value()) {
+        // Check the address for a valid address and port.
+        std::string parsed_host;
+        std::string err;
+        int port = -1;
+        if (!android::base::ParseNetAddress(host, &parsed_host, &port, nullptr, &err)) {
+            response = "Failed to parse address for pairing: " + err;
+            return;
+        }
+        if (port <= 0 || port > 65535) {
+            response = "Invalid port while parsing address [" + host + "]";
+            return;
+        }
     }
 
     auto priv_key = adb_auth_get_user_privkey();
@@ -220,7 +225,11 @@ void adb_wifi_pair_device(const std::string& host, const std::string& password,
 
     PairingResultWaiter waiter;
     std::unique_lock<std::mutex> lock(waiter.mutex_);
-    if (!client->Start(host, waiter.OnResult, &waiter)) {
+    if (!client->Start(mdns_info.has_value()
+                               ? android::base::StringPrintf("%s:%d", mdns_info->addr.c_str(),
+                                                             mdns_info->port)
+                               : host,
+                       waiter.OnResult, &waiter)) {
         response = "Failed: Unable to start pairing client.";
         return;
     }
@@ -242,5 +251,5 @@ void adb_wifi_pair_device(const std::string& host, const std::string& password,
     // Write to adb_known_hosts
     write_known_host_to_file(device_guid);
     // Try to auto-connect.
-    adb_secure_connect_by_service_name(device_guid.c_str());
+    adb_secure_connect_by_service_name(device_guid);
 }
