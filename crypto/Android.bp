@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "packages_modules_adb_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["packages_modules_adb_license"],
+}
+
 cc_defaults {
     name: "libadb_crypto_defaults",
     cflags: [
@@ -40,7 +49,7 @@ cc_defaults {
 
     visibility: [
         "//bootable/recovery/minadbd:__subpackages__",
-	"//packages/modules/adb:__subpackages__",
+        "//packages/modules/adb:__subpackages__",
     ],
 
     host_supported: true,
@@ -48,6 +57,7 @@ cc_defaults {
 
     shared_libs: [
         "libadb_protos",
+        "libadb_sysdeps",
         "libbase",
         "liblog",
         "libcrypto",
@@ -76,5 +86,6 @@ cc_library_static {
 
     static_libs: [
         "libadb_protos_static",
+        "libadb_sysdeps",
     ],
 }
