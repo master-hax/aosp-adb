@@ -104,6 +104,7 @@ enum ConnectionState {
     kCsAuthorizing,     // Authorizing with keys from ADB_VENDOR_KEYS.
     kCsUnauthorized,    // ADB_VENDOR_KEYS exhausted, fell back to user prompt.
     kCsNoPerm,          // Insufficient permissions to communicate with the device.
+    kCsDetached,        // USB device that's detached from the adb server.
     kCsOffline,
 
     kCsBootloader,
@@ -113,6 +114,8 @@ enum ConnectionState {
     kCsSideload,
     kCsRescue,
 };
+
+std::string to_string(ConnectionState state);
 
 inline bool ConnectionStateIsOnline(ConnectionState state) {
     switch (state) {
@@ -199,8 +202,6 @@ void put_apacket(apacket* p);
 void local_init(const std::string& addr);
 bool local_connect(int port);
 int local_connect_arbitrary_ports(int console_port, int adb_port, std::string* error);
-
-ConnectionState connection_state(atransport* t);
 
 extern const char* adb_device_banner;
 
