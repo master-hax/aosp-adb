@@ -24,6 +24,7 @@
 #include <ziparchive/zip_archive.h>
 #include <ziparchive/zip_writer.h>
 
+#include <array>
 #include <cinttypes>
 #include <numeric>
 #include <unordered_set>
@@ -31,6 +32,8 @@
 #include "adb_io.h"
 #include "adb_trace.h"
 #include "sysdeps.h"
+
+using namespace std::literals;
 
 namespace incremental {
 
@@ -76,16 +79,25 @@ static inline void append_int(borrowed_fd fd, std::vector<char>* bytes) {
     memcpy(bytes->data() + old_size, &le_val, sizeof(le_val));
 }
 
-static inline void append_bytes_with_size(borrowed_fd fd, std::vector<char>* bytes) {
+static inline bool append_bytes_with_size(borrowed_fd fd, std::vector<char>* bytes,
+                                          int* bytes_left) {
     int32_t le_size = read_int32(fd);
     if (le_size < 0) {
-        return;
+        return false;
     }
     int32_t size = int32_t(le32toh(le_size));
+    if (size < 0 || size > *bytes_left) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    *bytes_left -= size;
     auto old_size = bytes->size();
     bytes->resize(old_size + sizeof(le_size) + size);
     memcpy(bytes->data() + old_size, &le_size, sizeof(le_size));
     ReadFdExactly(fd, bytes->data() + old_size + sizeof(le_size), size);
+    return true;
 }
 
 static inline int32_t skip_bytes_with_size(borrowed_fd fd) {
@@ -98,13 +110,17 @@ static inline int32_t skip_bytes_with_size(borrowed_fd fd) {
 }
 
 std::pair<std::vector<char>, int32_t> read_id_sig_headers(borrowed_fd fd) {
-    std::vector<char> result;
-    append_int(fd, &result);              // version
-    append_bytes_with_size(fd, &result);  // hashingInfo
-    append_bytes_with_size(fd, &result);  // signingInfo
+    std::vector<char> signature;
+    append_int(fd, &signature);  // version
+    int max_size = kMaxSignatureSize - sizeof(int32_t);
+    // hashingInfo and signingInfo
+    if (!append_bytes_with_size(fd, &signature, &max_size) ||
+        !append_bytes_with_size(fd, &signature, &max_size)) {
+        return {};
+    }
     auto le_tree_size = read_int32(fd);
     auto tree_size = int32_t(le32toh(le_tree_size));  // size of the verity tree
-    return {std::move(result), tree_size};
+    return {std::move(signature), tree_size};
 }
 
 std::pair<off64_t, ssize_t> skip_id_sig_headers(borrowed_fd fd) {
@@ -299,26 +315,39 @@ static std::pair<ZipArchiveHandle, std::unique_ptr<android::base::MappedFile>> o
     return {zip, std::move(mapping)};
 }
 
-// TODO(b/151676293): avoid using libziparchive as it reads local file headers
-// which causes additional performance cost. Instead, only read from central directory.
 static std::vector<int32_t> InstallationPriorityBlocks(borrowed_fd fd, Size fileSize) {
+    static constexpr std::array<std::string_view, 3> additional_matches = {
+            "resources.arsc"sv, "AndroidManifest.xml"sv, "classes.dex"sv};
     auto [zip, _] = openZipArchive(fd, fileSize);
     if (!zip) {
         return {};
     }
 
+    auto matcher = [](std::string_view entry_name) {
+        if (entry_name.starts_with("lib/"sv) && entry_name.ends_with(".so"sv)) {
+            return true;
+        }
+        return std::any_of(additional_matches.begin(), additional_matches.end(),
+                           [entry_name](std::string_view i) { return i == entry_name; });
+    };
+
     void* cookie = nullptr;
-    if (StartIteration(zip, &cookie) != 0) {
+    if (StartIteration(zip, &cookie, std::move(matcher)) != 0) {
         D("%s failed at StartIteration: %d", __func__, errno);
         return {};
     }
 
     std::vector<int32_t> installationPriorityBlocks;
-    ZipEntry entry;
+    ZipEntry64 entry;
     std::string_view entryName;
     while (Next(cookie, &entry, &entryName) == 0) {
-        if (entryName == "resources.arsc" || entryName == "AndroidManifest.xml" ||
-            entryName.starts_with("lib/")) {
+        if (entryName == "classes.dex"sv) {
+            // Only the head is needed for installation
+            int32_t startBlockIndex = offsetToBlockIndex(entry.offset);
+            appendBlocks(startBlockIndex, 2, &installationPriorityBlocks);
+            D("\tadding to priority blocks: '%.*s' (%d)", (int)entryName.size(), entryName.data(),
+              2);
+        } else {
             // Full entries are needed for installation
             off64_t entryStartOffset = entry.offset;
             off64_t entryEndOffset =
@@ -330,12 +359,8 @@ static std::vector<int32_t> InstallationPriorityBlocks(borrowed_fd fd, Size file
             int32_t endBlockIndex = offsetToBlockIndex(entryEndOffset);
             int32_t numNewBlocks = endBlockIndex - startBlockIndex + 1;
             appendBlocks(startBlockIndex, numNewBlocks, &installationPriorityBlocks);
-            D("\tadding to priority blocks: '%.*s'", (int)entryName.size(), entryName.data());
-        } else if (entryName == "classes.dex") {
-            // Only the head is needed for installation
-            int32_t startBlockIndex = offsetToBlockIndex(entry.offset);
-            appendBlocks(startBlockIndex, 2, &installationPriorityBlocks);
-            D("\tadding to priority blocks: '%.*s'", (int)entryName.size(), entryName.data());
+            D("\tadding to priority blocks: '%.*s' (%d)", (int)entryName.size(), entryName.data(),
+              numNewBlocks);
         }
     }
 
@@ -346,7 +371,7 @@ static std::vector<int32_t> InstallationPriorityBlocks(borrowed_fd fd, Size file
 
 std::vector<int32_t> PriorityBlocksForFile(const std::string& filepath, borrowed_fd fd,
                                            Size fileSize) {
-    if (!android::base::EndsWithIgnoreCase(filepath, ".apk")) {
+    if (!android::base::EndsWithIgnoreCase(filepath, ".apk"sv)) {
         return {};
     }
     off64_t signerOffset = SignerBlockOffset(fd, fileSize);
