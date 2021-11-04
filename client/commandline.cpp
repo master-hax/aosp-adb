@@ -681,16 +681,11 @@ static int RemoteShell(bool use_shell_protocol, const std::string& type_arg, cha
 }
 
 static int adb_shell(int argc, const char** argv) {
-    std::string error;
-    auto&& features = adb_get_feature_set(&error);
-    if (!features) {
-        error_exit("%s", error.c_str());
-    }
-
     enum PtyAllocationMode { kPtyAuto, kPtyNo, kPtyYes, kPtyDefinitely };
 
     // Defaults.
     char escape_char = '~';                                                 // -e
+    auto&& features = adb_get_feature_set_or_die();
     bool use_shell_protocol = CanUseFeature(*features, kFeatureShell2);     // -x
     PtyAllocationMode tty = use_shell_protocol ? kPtyAuto : kPtyDefinitely; // -t/-T
 
@@ -787,12 +782,7 @@ static int adb_shell(int argc, const char** argv) {
 }
 
 static int adb_abb(int argc, const char** argv) {
-    std::string error;
-    auto&& features = adb_get_feature_set(&error);
-    if (!features) {
-        error_exit("%s", error.c_str());
-        return 1;
-    }
+    auto&& features = adb_get_feature_set_or_die();
     if (!CanUseFeature(*features, kFeatureAbb)) {
         error_exit("abb is not supported by the device");
     }
@@ -1474,6 +1464,41 @@ static int adb_connect_command_bidirectional(const std::string& command) {
     return 0;
 }
 
+const std::optional<FeatureSet>& adb_get_feature_set_or_die(void) {
+    std::string error;
+    const std::optional<FeatureSet>& features = adb_get_feature_set(&error);
+    if (!features) {
+        error_exit("%s", error.c_str());
+    }
+    return features;
+}
+
+// Helper function to handle processing of shell service commands:
+// remount, disable/enable-verity
+static int process_service(const int argc, const char** argv) {
+    bool can_use_feature(true);  // Support enable/disable-verity since there's no
+    // feature-related baggage for these services.
+
+    if (!strcmp(argv[0], "remount")) {  // remount service is special since it
+        // used to be in-process/resident in adbd, so we maintain feature status.
+        auto&& features = adb_get_feature_set_or_die();
+        if (!CanUseFeature(*features, kFeatureRemountShell)) {
+            can_use_feature = false;
+        }
+    }
+
+    if (can_use_feature) {  // Legacy behavior fallback until restart or n/a?
+        std::vector<const char*> args = {"shell"};
+        args.insert(args.cend(), argv, argv + argc);
+        return adb_shell_noinput(args.size(), args.data());
+    } else if (argc > 1) {
+        auto command = android::base::StringPrintf("%s:%s", argv[0], argv[1]);
+        return adb_connect_command(command);
+    } else {
+        return adb_connect_command(std::string(argv[0]) + ":");
+    }
+}
+
 static int adb_query_command(const std::string& command) {
     std::string result;
     std::string error;
@@ -1834,32 +1859,11 @@ int adb_commandline(int argc, const char** argv) {
             error_exit("tcpip: invalid port: %s", argv[1]);
         }
         return adb_connect_command(android::base::StringPrintf("tcpip:%d", port));
-    } else if (!strcmp(argv[0], "remount")) {
-        std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
-        }
-
-        if (CanUseFeature(*features, kFeatureRemountShell)) {
-            std::vector<const char*> args = {"shell"};
-            args.insert(args.cend(), argv, argv + argc);
-            return adb_shell_noinput(args.size(), args.data());
-        } else if (argc > 1) {
-            auto command = android::base::StringPrintf("%s:%s", argv[0], argv[1]);
-            return adb_connect_command(command);
-        } else {
-            return adb_connect_command("remount:");
-        }
-    }
-    // clang-format off
-    else if (!strcmp(argv[0], "reboot") ||
-             !strcmp(argv[0], "reboot-bootloader") ||
-             !strcmp(argv[0], "reboot-fastboot") ||
-             !strcmp(argv[0], "usb") ||
-             !strcmp(argv[0], "disable-verity") ||
-             !strcmp(argv[0], "enable-verity")) {
-        // clang-format on
+    } else if (!strcmp(argv[0], "remount") || !strcmp(argv[0], "disable-verity") ||
+               !strcmp(argv[0], "enable-verity")) {
+        return process_service(argc, argv);
+    } else if (!strcmp(argv[0], "reboot") || !strcmp(argv[0], "reboot-bootloader") ||
+               !strcmp(argv[0], "reboot-fastboot") || !strcmp(argv[0], "usb")) {
         std::string command;
         if (!strcmp(argv[0], "reboot-bootloader")) {
             command = "reboot:bootloader";
@@ -2083,11 +2087,7 @@ int adb_commandline(int argc, const char** argv) {
     } else if (!strcmp(argv[0], "track-jdwp")) {
         return adb_connect_command("track-jdwp");
     } else if (!strcmp(argv[0], "track-app")) {
-        std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
-        }
+        auto&& features = adb_get_feature_set_or_die();
         if (!CanUseFeature(*features, kFeatureTrackApp)) {
             error_exit("track-app is not supported by the device");
         }
@@ -2114,11 +2114,7 @@ int adb_commandline(int argc, const char** argv) {
         return 0;
     } else if (!strcmp(argv[0], "features")) {
         // Only list the features common to both the adb client and the device.
-        std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
-        }
+        auto&& features = adb_get_feature_set_or_die();
 
         for (const std::string& name : *features) {
             if (CanUseFeature(*features, name)) {
