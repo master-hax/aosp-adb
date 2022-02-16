@@ -19,16 +19,12 @@
 
 #include <android-base/strings.h>
 
-#include <optional>
-
 #include "adb.h"
 #include "adb_client.h"
 #include "adb_unique_fd.h"
-#include "transport.h"
 
 // Callback used to handle the standard streams (stdout and stderr) sent by the
 // device's upon receiving a command.
-
 //
 class StandardStreamsCallbackInterface {
   public:
@@ -103,9 +99,6 @@ class SilentStandardStreamsCallbackInterface : public StandardStreamsCallbackInt
 extern DefaultStandardStreamsCallback DEFAULT_STANDARD_STREAMS_CALLBACK;
 
 int adb_commandline(int argc, const char** argv);
-
-// Helper retrieval function.
-const std::optional<FeatureSet>& adb_get_feature_set_or_die(void);
 
 bool copy_to_file(int inFd, int outFd);
 

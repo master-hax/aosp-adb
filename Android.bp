@@ -146,21 +146,22 @@ library_linking_strategy_cc_defaults {
     static_libs: [
         "libadb_crypto",
         "libadb_pairing_connection",
-        "libadb_protos",
         "libadb_sysdeps",
         "libadb_tls_connection",
-        "libadbconnection_server",
         "libadbd",
         "libadbd_core",
-        "libapp_processes_protos_lite",
+        "libadbconnection_server",
         "libasyncio",
         "libbrotli",
         "libcrypto_utils",
         "libcutils_sockets",
         "libdiagnose_usb",
         "libmdnssd",
-        "libprotobuf-cpp-lite",
         "libzstd",
+
+        "libadb_protos",
+        "libapp_processes_protos_lite",
+        "libprotobuf-cpp-lite",
     ],
 
     shared_libs: [
@@ -300,21 +301,21 @@ cc_library_host_static {
 
     static_libs: [
         "libadb_crypto",
-        "libadb_pairing_connection",
         "libadb_protos",
+        "libadb_pairing_connection",
         "libadb_tls_connection",
         "libbase",
-        "libcrypto",
         "libcrypto_utils",
-        "libcutils",
+        "libcrypto",
         "libdiagnose_usb",
-        "liblog",
         "libmdnssd",
+        "libusb",
+        "libutils",
+        "liblog",
+        "libcutils",
         "libopenscreen-discovery",
         "libopenscreen-platform-impl",
         "libprotobuf-cpp-lite",
-        "libusb",
-        "libutils",
     ],
 }
 
@@ -373,12 +374,12 @@ cc_test_host {
         "libadb_sysdeps",
         "libadb_tls_connection_static",
         "libbase",
-        "libcrypto",
-        "libcrypto_utils",
         "libcutils",
-        "libdiagnose_usb",
+        "libcrypto_utils",
+        "libcrypto",
         "liblog",
         "libmdnssd",
+        "libdiagnose_usb",
         "libopenscreen-discovery",
         "libopenscreen-platform-impl",
         "libprotobuf-cpp-lite",
@@ -435,12 +436,11 @@ cc_binary_host {
         "libapp_processes_protos_full",
         "libbase",
         "libbrotli",
-        "libcrypto",
-        "libcrypto_utils",
         "libcutils",
-        "libdiagnose_usb",
+        "libcrypto_utils",
+        "libcrypto",
         "libfastdeploy_host",
-        "liblog",
+        "libdiagnose_usb",
         "liblog",
         "liblz4",
         "libmdnssd",
@@ -450,8 +450,9 @@ cc_binary_host {
         "libssl",
         "libusb",
         "libutils",
-        "libz",
+        "liblog",
         "libziparchive",
+        "libz",
         "libzstd",
     ],
 
@@ -510,11 +511,11 @@ cc_library_static {
     ],
 
     shared_libs: [
+        "libadbconnection_server",
         "libadb_crypto",
         "libadb_pairing_connection",
         "libadb_protos",
         "libadb_tls_connection",
-        "libadbconnection_server",
         "libadbd_auth",
         "libapp_processes_protos_lite",
         "libasyncio",
@@ -549,7 +550,6 @@ cc_library_static {
         }
     },
 
-    min_sdk_version: "30",
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
@@ -584,7 +584,6 @@ cc_library {
         "libbrotli",
         "libdiagnose_usb",
         "liblz4",
-        "libprotobuf-cpp-lite",
         "libzstd",
     ],
 
@@ -598,6 +597,7 @@ cc_library {
         "libbase",
         "libcrypto_utils",
         "libcutils_sockets",
+        "libprotobuf-cpp-lite",
 
         // APEX dependencies.
         "libadbd_auth",
@@ -630,7 +630,6 @@ cc_library {
         },
     },
 
-    min_sdk_version: "30",
     apex_available: [
         "//apex_available:platform",
         "com.android.adbd",
@@ -645,7 +644,6 @@ cc_library {
     name: "libadbd",
     defaults: ["adbd_defaults", "host_adbd_supported"],
     recovery_available: true,
-    min_sdk_version: "30",
     apex_available: ["com.android.adbd"],
 
     // avoid getting duplicate symbol of android::build::getbuildnumber().
@@ -654,21 +652,10 @@ cc_library {
     // libminadbd wants both, as it's used to build native tests.
     compile_multilib: "both",
 
-    static_libs: [
-        "libadbd_core",
-        "libadbd_services",
-        "libbrotli",
-        "libcutils_sockets",
-        "libdiagnose_usb",
-        "liblz4",
-        "libmdnssd",
-        "libprotobuf-cpp-lite",
-        "libzstd",
-    ],
-
     shared_libs: [
         "libadbconnection_server",
         "libapp_processes_protos_lite",
+        "libprotobuf-cpp-lite",
         "libadb_crypto",
         "libadb_pairing_connection",
         "libadb_tls_connection",
@@ -682,6 +669,7 @@ cc_library {
         // APEX dependencies on the system image.
         "libadbd_auth",
         "libadbd_fs",
+        "libadbd_services",
     ],
 
     target: {
@@ -693,6 +681,15 @@ cc_library {
         }
     },
 
+    static_libs: [
+        "libadbd_core",
+        "libbrotli",
+        "libcutils_sockets",
+        "libdiagnose_usb",
+        "liblz4",
+        "libmdnssd",
+        "libzstd",
+    ],
 
     visibility: [
         "//bootable/recovery/minadbd",
@@ -704,7 +701,6 @@ cc_binary {
     name: "adbd",
     defaults: ["adbd_defaults", "host_adbd_supported", "libadbd_binary_dependencies"],
     recovery_available: true,
-    min_sdk_version: "30",
     apex_available: ["com.android.adbd"],
 
     srcs: [
@@ -721,7 +717,6 @@ cc_binary {
     },
 
     static_libs: [
-        "libadb_protos",
         "libadbd",
         "libadbd_services",
         "libasyncio",
@@ -732,6 +727,7 @@ cc_binary {
     ],
 
     shared_libs: [
+        "libadb_protos",
         "libadbd_auth",
     ],
 
@@ -760,8 +756,8 @@ phony {
 phony {
     name: "adbd_system_api_recovery",
     required: [
-        "libadbd_auth.recovery",
-        "libadbd_fs.recovery",
+        "libadbd_auth",
+        "libadbd_fs",
         "reboot.recovery",
     ],
 }
@@ -915,16 +911,16 @@ cc_library_host_static {
         "libadb_host",
         "libandroidfw",
         "libbase",
-        "libcrypto",
-        "libcrypto_utils",
         "libcutils",
+        "libcrypto_utils",
+        "libcrypto",
         "libdiagnose_usb",
         "liblog",
         "libmdnssd",
         "libusb",
         "libutils",
-        "libz",
         "libziparchive",
+        "libz",
     ],
     proto: {
         type: "lite",
@@ -956,9 +952,9 @@ cc_test_host {
         "libadb_tls_connection_static",
         "libandroidfw",
         "libbase",
-        "libcrypto",
-        "libcrypto_utils",
         "libcutils",
+        "libcrypto_utils",
+        "libcrypto",
         "libdiagnose_usb",
         "libfastdeploy_host",
         "liblog",
@@ -969,8 +965,8 @@ cc_test_host {
         "libssl",
         "libusb",
         "libutils",
-        "libz",
         "libziparchive",
+        "libz",
     ],
     target: {
         windows: {
