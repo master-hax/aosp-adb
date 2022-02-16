@@ -104,7 +104,6 @@ enum ConnectionState {
     kCsAuthorizing,     // Authorizing with keys from ADB_VENDOR_KEYS.
     kCsUnauthorized,    // ADB_VENDOR_KEYS exhausted, fell back to user prompt.
     kCsNoPerm,          // Insufficient permissions to communicate with the device.
-    kCsDetached,        // USB device that's detached from the adb server.
     kCsOffline,
 
     kCsBootloader,
@@ -114,8 +113,6 @@ enum ConnectionState {
     kCsSideload,
     kCsRescue,
 };
-
-std::string to_string(ConnectionState state);
 
 inline bool ConnectionStateIsOnline(ConnectionState state) {
     switch (state) {
@@ -135,9 +132,8 @@ void print_packet(const char* label, apacket* p);
 
 void handle_packet(apacket* p, atransport* t);
 
-int launch_server(const std::string& socket_spec, const char* one_device);
-int adb_server_main(int is_daemon, const std::string& socket_spec, const char* one_device,
-                    int ack_reply_fd);
+int launch_server(const std::string& socket_spec);
+int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply_fd);
 
 /* initialize a transport object's func pointers and state */
 int init_socket_transport(atransport* t, unique_fd s, int port, int local);
@@ -203,6 +199,8 @@ void put_apacket(apacket* p);
 void local_init(const std::string& addr);
 bool local_connect(int port);
 int local_connect_arbitrary_ports(int console_port, int adb_port, std::string* error);
+
+ConnectionState connection_state(atransport* t);
 
 extern const char* adb_device_banner;
 
