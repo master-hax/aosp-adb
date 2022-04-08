@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <deque>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -39,7 +40,6 @@
 #include <adb/crypto/x509_generator.h>
 #include <adb/tls/tls_connection.h>
 #include <android-base/logging.h>
-#include <android-base/no_destructor.h>
 #include <android-base/parsenetaddress.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
@@ -81,14 +81,8 @@ const char* const kFeatureAbb = "abb";
 const char* const kFeatureFixedPushSymlinkTimestamp = "fixed_push_symlink_timestamp";
 const char* const kFeatureAbbExec = "abb_exec";
 const char* const kFeatureRemountShell = "remount_shell";
-const char* const kFeatureTrackApp = "track_app";
 const char* const kFeatureSendRecv2 = "sendrecv_v2";
 const char* const kFeatureSendRecv2Brotli = "sendrecv_v2_brotli";
-const char* const kFeatureSendRecv2LZ4 = "sendrecv_v2_lz4";
-const char* const kFeatureSendRecv2Zstd = "sendrecv_v2_zstd";
-const char* const kFeatureSendRecv2DryRunSend = "sendrecv_v2_dry_run_send";
-// TODO(joshuaduong): Bump to v2 when openscreen discovery is enabled by default
-const char* const kFeatureOpenscreenMdns = "openscreen_mdns";
 
 namespace {
 
@@ -131,8 +125,8 @@ class ReconnectHandler {
     };
 
     // Only retry for up to one minute.
-    static constexpr const std::chrono::seconds kDefaultTimeout = 3s;
-    static constexpr const size_t kMaxAttempts = 20;
+    static constexpr const std::chrono::seconds kDefaultTimeout = 10s;
+    static constexpr const size_t kMaxAttempts = 6;
 
     // Protects all members.
     std::mutex reconnect_mutex_;
@@ -505,8 +499,12 @@ bool FdConnection::DoTlsHandshake(RSA* key, std::string* auth_key) {
     auto x509 = GenerateX509Certificate(evp_pkey.get());
     auto x509_str = X509ToPEMString(x509.get());
     auto evp_str = Key::ToPEMString(evp_pkey.get());
-
+#ifdef _WIN32
     int osh = cast_handle_to_int(adb_get_os_handle(fd_));
+#else
+    int osh = adb_get_os_handle(fd_);
+#endif
+
 #if ADB_HOST
     tls_ = TlsConnection::Create(TlsConnection::Role::Client, x509_str, evp_str, osh);
 #else
@@ -931,7 +929,6 @@ static void transport_destroy(atransport* t) {
     remove_transport(t);
 }
 
-#if ADB_HOST
 static int qual_match(const std::string& to_test, const char* prefix, const std::string& qual,
                       bool sanitize_qual) {
     if (to_test.empty()) /* Return true if both the qual and to_test are empty strings. */
@@ -1087,13 +1084,10 @@ void ConnectionWaitable::SetConnectionEstablished(bool success) {
     }
     cv_.notify_one();
 }
-#endif
 
 atransport::~atransport() {
-#if ADB_HOST
     // If the connection callback had not been run before, run it now.
     SetConnectionEstablished(false);
-#endif
 }
 
 int atransport::Write(apacket* p) {
@@ -1121,10 +1115,9 @@ ConnectionState atransport::GetConnectionState() const {
 void atransport::SetConnectionState(ConnectionState state) {
     check_main_thread();
     connection_state_ = state;
-    update_transports();
 }
 
-void atransport::SetConnection(std::shared_ptr<Connection> connection) {
+void atransport::SetConnection(std::unique_ptr<Connection> connection) {
     std::lock_guard<std::mutex> lock(mutex_);
     connection_ = std::shared_ptr<Connection>(std::move(connection));
 }
@@ -1177,31 +1170,25 @@ size_t atransport::get_max_payload() const {
 }
 
 const FeatureSet& supported_features() {
-    static const android::base::NoDestructor<FeatureSet> features([] {
-        return FeatureSet{
-                kFeatureShell2,
-                kFeatureCmd,
-                kFeatureStat2,
-                kFeatureLs2,
-                kFeatureFixedPushMkdir,
-                kFeatureApex,
-                kFeatureAbb,
-                kFeatureFixedPushSymlinkTimestamp,
-                kFeatureAbbExec,
-                kFeatureRemountShell,
-                kFeatureTrackApp,
-                kFeatureSendRecv2,
-                kFeatureSendRecv2Brotli,
-                kFeatureSendRecv2LZ4,
-                kFeatureSendRecv2Zstd,
-                kFeatureSendRecv2DryRunSend,
-                kFeatureOpenscreenMdns,
-                // Increment ADB_SERVER_VERSION when adding a feature that adbd needs
-                // to know about. Otherwise, the client can be stuck running an old
-                // version of the server even after upgrading their copy of adb.
-                // (http://b/24370690)
-        };
-    }());
+    // Local static allocation to avoid global non-POD variables.
+    static const FeatureSet* features = new FeatureSet{
+            kFeatureShell2,
+            kFeatureCmd,
+            kFeatureStat2,
+            kFeatureLs2,
+            kFeatureFixedPushMkdir,
+            kFeatureApex,
+            kFeatureAbb,
+            kFeatureFixedPushSymlinkTimestamp,
+            kFeatureAbbExec,
+            kFeatureRemountShell,
+            kFeatureSendRecv2,
+            kFeatureSendRecv2Brotli,
+            // Increment ADB_SERVER_VERSION when adding a feature that adbd needs
+            // to know about. Otherwise, the client can be stuck running an old
+            // version of the server even after upgrading their copy of adb.
+            // (http://b/24370690)
+    };
 
     return *features;
 }
@@ -1215,20 +1202,16 @@ FeatureSet StringToFeatureSet(const std::string& features_string) {
         return FeatureSet();
     }
 
-    return android::base::Split(features_string, ",");
-}
-
-template <class Range, class Value>
-static bool contains(const Range& r, const Value& v) {
-    return std::find(std::begin(r), std::end(r), v) != std::end(r);
+    auto names = android::base::Split(features_string, ",");
+    return FeatureSet(names.begin(), names.end());
 }
 
 bool CanUseFeature(const FeatureSet& feature_set, const std::string& feature) {
-    return contains(feature_set, feature) && contains(supported_features(), feature);
+    return feature_set.count(feature) > 0 && supported_features().count(feature) > 0;
 }
 
 bool atransport::has_feature(const std::string& feature) const {
-    return contains(features_, feature);
+    return features_.count(feature) > 0;
 }
 
 void atransport::SetFeatures(const std::string& features_string) {
@@ -1250,7 +1233,6 @@ void atransport::RunDisconnects() {
     disconnects_.clear();
 }
 
-#if ADB_HOST
 bool atransport::MatchesTarget(const std::string& target) const {
     if (!serial.empty()) {
         if (target == serial) {
@@ -1293,6 +1275,8 @@ void atransport::SetConnectionEstablished(bool success) {
 ReconnectResult atransport::Reconnect() {
     return reconnect_(this);
 }
+
+#if ADB_HOST
 
 // We use newline as our delimiter, make sure to never output it.
 static std::string sanitize(std::string str, bool alphanumeric) {
@@ -1375,7 +1359,7 @@ void close_usb_devices(std::function<bool(const atransport*)> predicate, bool re
 void close_usb_devices(bool reset) {
     close_usb_devices([](const atransport*) { return true; }, reset);
 }
-#endif
+#endif  // ADB_HOST
 
 bool register_socket_transport(unique_fd s, std::string serial, int port, int local,
                                atransport::ReconnectCallback reconnect, bool use_tls, int* error) {
@@ -1415,9 +1399,7 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
 
     lock.unlock();
 
-#if ADB_HOST
     auto waitable = t->connection_waitable();
-#endif
     register_transport(t);
 
     if (local == 1) {
@@ -1425,7 +1407,6 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
         return true;
     }
 
-#if ADB_HOST
     if (!waitable->WaitForConnection(std::chrono::seconds(10))) {
         if (error) *error = ETIMEDOUT;
         return false;
@@ -1435,7 +1416,6 @@ bool register_socket_transport(unique_fd s, std::string serial, int port, int lo
         if (error) *error = EPERM;
         return false;
     }
-#endif
 
     return true;
 }
@@ -1466,30 +1446,14 @@ void kick_all_tcp_devices() {
             t->Kick();
         }
     }
+#if ADB_HOST
     reconnect_handler.CheckForKicked();
+#endif
 }
 
-void register_usb_transport(std::shared_ptr<Connection> connection, const char* serial,
-                            const char* devpath, unsigned writeable) {
-    atransport* t = new atransport(writeable ? kCsOffline : kCsNoPerm);
-    if (serial) {
-        t->serial = serial;
-    }
-    if (devpath) {
-        t->devpath = devpath;
-    }
+#endif
 
-    t->SetConnection(std::move(connection));
-    t->type = kTransportUsb;
-
-    {
-        std::lock_guard<std::recursive_mutex> lock(transport_lock);
-        pending_list.push_front(t);
-    }
-
-    register_transport(t);
-}
-
+#if ADB_HOST
 void register_usb_transport(usb_handle* usb, const char* serial, const char* devpath,
                             unsigned writeable) {
     atransport* t = new atransport(writeable ? kCsOffline : kCsNoPerm);
@@ -1511,7 +1475,9 @@ void register_usb_transport(usb_handle* usb, const char* serial, const char* dev
 
     register_transport(t);
 }
+#endif
 
+#if ADB_HOST
 // This should only be used for transports with connection_state == kCsNoPerm.
 void unregister_usb_transport(usb_handle* usb) {
     std::lock_guard<std::recursive_mutex> lock(transport_lock);
@@ -1558,7 +1524,8 @@ std::shared_ptr<RSA> atransport::NextKey() {
         keys_.pop_front();
     }
 
-    return Key();
+    std::shared_ptr<RSA> result = keys_[0];
+    return result;
 }
 
 void atransport::ResetKeys() {

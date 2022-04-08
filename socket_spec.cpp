@@ -29,7 +29,6 @@
 #include <cutils/sockets.h>
 
 #include "adb.h"
-#include "adb_mdns.h"
 #include "adb_utils.h"
 #include "sysdeps.h"
 
@@ -104,6 +103,12 @@ bool parse_tcp_socket_spec(std::string_view spec, std::string* hostname, int* po
         if (!android::base::ParseNetAddress(addr, &hostname_value, &port_value, serial, error)) {
             return false;
         }
+
+        if (port_value == -1) {
+            *error = "missing port in specification: ";
+            *error += spec;
+            return false;
+        }
     }
 
     if (hostname) {
@@ -164,7 +169,7 @@ bool is_socket_spec(std::string_view spec) {
             return true;
         }
     }
-    return spec.starts_with("tcp:") || spec.starts_with("acceptfd:") || spec.starts_with("vsock:");
+    return spec.starts_with("tcp:") || spec.starts_with("acceptfd:");
 }
 
 bool is_local_socket_spec(std::string_view spec) {
@@ -196,24 +201,7 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
             fd->reset(network_loopback_client(port_value, SOCK_STREAM, error));
         } else {
 #if ADB_HOST
-            // Check if the address is an mdns service we can connect to.
-            if (auto mdns_info = mdns_get_connect_service_info(std::string(address.substr(4)));
-                mdns_info != std::nullopt) {
-                fd->reset(network_connect(mdns_info->addr, mdns_info->port, SOCK_STREAM, 0, error));
-                if (fd->get() != -1) {
-                    // TODO(joshuaduong): We still show the ip address for the serial. Change it to
-                    // use the mdns instance name, so we can adjust to address changes on
-                    // reconnects.
-                    port_value = mdns_info->port;
-                    if (serial) {
-                        *serial = android::base::StringPrintf("%s.%s",
-                                                              mdns_info->service_name.c_str(),
-                                                              mdns_info->service_type.c_str());
-                    }
-                }
-            } else {
-                fd->reset(network_connect(hostname, port_value, SOCK_STREAM, 0, error));
-            }
+            fd->reset(network_connect(hostname, port_value, SOCK_STREAM, 0, error));
 #else
             // Disallow arbitrary connections in adbd.
             *error = "adbd does not support arbitrary tcp connections";
@@ -222,12 +210,6 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
         }
 
         if (fd->get() > 0) {
-            int keepalive_interval = 1;
-            if (const char* keepalive_env = getenv("ADB_TCP_KEEPALIVE_INTERVAL")) {
-                android::base::ParseInt(keepalive_env, &keepalive_interval, 0);
-            }
-
-            set_tcp_keepalive(fd->get(), keepalive_interval);
             disable_tcp_nagle(fd->get());
             if (port) {
                 *port = port_value;
@@ -241,7 +223,7 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
         std::vector<std::string> fragments = android::base::Split(spec_str, ":");
         unsigned int port_value = port ? *port : 0;
         if (fragments.size() != 2 && fragments.size() != 3) {
-            *error = android::base::StringPrintf("expected vsock:cid or vsock:cid:port in '%s'",
+            *error = android::base::StringPrintf("expected vsock:cid or vsock:port:cid in '%s'",
                                                  spec_str.c_str());
             errno = EINVAL;
             return false;
@@ -288,7 +270,7 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
         }
         return true;
 #else   // ADB_LINUX
-        *error = "vsock is only supported on Linux";
+        *error = "vsock is only supported on linux";
         return false;
 #endif  // ADB_LINUX
     } else if (address.starts_with("acceptfd:")) {

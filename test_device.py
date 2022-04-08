@@ -77,18 +77,16 @@ def requires_non_root(func):
 
 
 class DeviceTest(unittest.TestCase):
-    device = adb.get_device()
+    def setUp(self):
+        self.device = adb.get_device()
 
 
 class AbbTest(DeviceTest):
     def test_smoke(self):
-        abb = subprocess.run(['adb', 'abb'], capture_output=True)
-        cmd = subprocess.run(['adb', 'shell', 'cmd'], capture_output=True)
-
-        # abb squashes all failures to 1.
-        self.assertEqual(abb.returncode == 0, cmd.returncode == 0)
-        self.assertEqual(abb.stdout, cmd.stdout)
-        self.assertEqual(abb.stderr, cmd.stderr)
+        result = subprocess.run(['adb', 'abb'], capture_output=True)
+        self.assertEqual(1, result.returncode)
+        expected_output = b"cmd: No service specified; use -l to list all services\n"
+        self.assertEqual(expected_output, result.stderr)
 
 class ForwardReverseTest(DeviceTest):
     def _test_no_rebind(self, description, direction_list, direction,
@@ -627,7 +625,6 @@ class ArgumentEscapingTest(DeviceTest):
             os.remove(tf.name)
 
 
-@unittest.skip("b/172372960: temporarily disabled due to flakiness")
 class RootUnrootTest(DeviceTest):
     def _test_root(self):
         message = self.device.root()
@@ -756,640 +753,535 @@ def make_random_device_files(device, in_dir, num_files, prefix='device_tmpfile')
     return files
 
 
-class FileOperationsTest:
-    class Base(DeviceTest):
-        SCRATCH_DIR = '/data/local/tmp'
-        DEVICE_TEMP_FILE = SCRATCH_DIR + '/adb_test_file'
-        DEVICE_TEMP_DIR = SCRATCH_DIR + '/adb_test_dir'
+class FileOperationsTest(DeviceTest):
+    SCRATCH_DIR = '/data/local/tmp'
+    DEVICE_TEMP_FILE = SCRATCH_DIR + '/adb_test_file'
+    DEVICE_TEMP_DIR = SCRATCH_DIR + '/adb_test_dir'
 
-        def setUp(self):
-            self.previous_env = os.environ.get("ADB_COMPRESSION")
-            os.environ["ADB_COMPRESSION"] = self.compression
+    def _verify_remote(self, checksum, remote_path):
+        dev_md5, _ = self.device.shell([get_md5_prog(self.device),
+                                        remote_path])[0].split()
+        self.assertEqual(checksum, dev_md5)
 
-        def tearDown(self):
-            if self.previous_env is None:
-                del os.environ["ADB_COMPRESSION"]
-            else:
-                os.environ["ADB_COMPRESSION"] = self.previous_env
+    def _verify_local(self, checksum, local_path):
+        with open(local_path, 'rb') as host_file:
+            host_md5 = compute_md5(host_file.read())
+            self.assertEqual(host_md5, checksum)
 
-        def _verify_remote(self, checksum, remote_path):
-            dev_md5, _ = self.device.shell([get_md5_prog(self.device),
-                                            remote_path])[0].split()
-            self.assertEqual(checksum, dev_md5)
+    def test_push(self):
+        """Push a randomly generated file to specified device."""
+        kbytes = 512
+        tmp = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+        rand_str = os.urandom(1024 * kbytes)
+        tmp.write(rand_str)
+        tmp.close()
 
-        def _verify_local(self, checksum, local_path):
-            with open(local_path, 'rb') as host_file:
-                host_md5 = compute_md5(host_file.read())
-                self.assertEqual(host_md5, checksum)
+        self.device.shell(['rm', '-rf', self.DEVICE_TEMP_FILE])
+        self.device.push(local=tmp.name, remote=self.DEVICE_TEMP_FILE)
 
-        def test_push(self):
-            """Push a randomly generated file to specified device."""
-            kbytes = 512
-            tmp = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-            rand_str = os.urandom(1024 * kbytes)
-            tmp.write(rand_str)
-            tmp.close()
+        self._verify_remote(compute_md5(rand_str), self.DEVICE_TEMP_FILE)
+        self.device.shell(['rm', '-f', self.DEVICE_TEMP_FILE])
 
-            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_FILE])
-            self.device.push(local=tmp.name, remote=self.DEVICE_TEMP_FILE)
+        os.remove(tmp.name)
 
-            self._verify_remote(compute_md5(rand_str), self.DEVICE_TEMP_FILE)
-            self.device.shell(['rm', '-f', self.DEVICE_TEMP_FILE])
+    def test_push_dir(self):
+        """Push a randomly generated directory of files to the device."""
+        self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
 
-            os.remove(tmp.name)
+        try:
+            host_dir = tempfile.mkdtemp()
 
-        def test_push_dir(self):
-            """Push a randomly generated directory of files to the device."""
+            # Make sure the temp directory isn't setuid, or else adb will complain.
+            os.chmod(host_dir, 0o700)
+
+            # Create 32 random files.
+            temp_files = make_random_host_files(in_dir=host_dir, num_files=32)
+            self.device.push(host_dir, self.DEVICE_TEMP_DIR)
+
+            for temp_file in temp_files:
+                remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
+                                             os.path.basename(host_dir),
+                                             temp_file.base_name)
+                self._verify_remote(temp_file.checksum, remote_path)
             self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-            try:
-                host_dir = tempfile.mkdtemp()
+    def disabled_test_push_empty(self):
+        """Push an empty directory to the device."""
+        self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
 
-                # Make sure the temp directory isn't setuid, or else adb will complain.
-                os.chmod(host_dir, 0o700)
+        try:
+            host_dir = tempfile.mkdtemp()
 
-                # Create 32 random files.
-                temp_files = make_random_host_files(in_dir=host_dir, num_files=32)
-                self.device.push(host_dir, self.DEVICE_TEMP_DIR)
+            # Make sure the temp directory isn't setuid, or else adb will complain.
+            os.chmod(host_dir, 0o700)
 
-                for temp_file in temp_files:
-                    remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
-                                                 os.path.basename(host_dir),
-                                                 temp_file.base_name)
-                    self._verify_remote(temp_file.checksum, remote_path)
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
+            # Create an empty directory.
+            empty_dir_path = os.path.join(host_dir, 'empty')
+            os.mkdir(empty_dir_path);
 
-        def disabled_test_push_empty(self):
-            """Push an empty directory to the device."""
+            self.device.push(empty_dir_path, self.DEVICE_TEMP_DIR)
+
+            remote_path = os.path.join(self.DEVICE_TEMP_DIR, "empty")
+            test_empty_cmd = ["[", "-d", remote_path, "]"]
+            rc, _, _ = self.device.shell_nocheck(test_empty_cmd)
+
+            self.assertEqual(rc, 0)
             self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-            try:
-                host_dir = tempfile.mkdtemp()
+    @unittest.skipIf(sys.platform == "win32", "symlinks require elevated privileges on windows")
+    def test_push_symlink(self):
+        """Push a symlink.
 
-                # Make sure the temp directory isn't setuid, or else adb will complain.
-                os.chmod(host_dir, 0o700)
+        Bug: http://b/31491920
+        """
+        try:
+            host_dir = tempfile.mkdtemp()
 
-                # Create an empty directory.
-                empty_dir_path = os.path.join(host_dir, 'empty')
-                os.mkdir(empty_dir_path);
+            # Make sure the temp directory isn't setuid, or else adb will
+            # complain.
+            os.chmod(host_dir, 0o700)
 
-                self.device.push(empty_dir_path, self.DEVICE_TEMP_DIR)
+            with open(os.path.join(host_dir, 'foo'), 'w') as f:
+                f.write('foo')
 
-                remote_path = os.path.join(self.DEVICE_TEMP_DIR, "empty")
-                test_empty_cmd = ["[", "-d", remote_path, "]"]
-                rc, _, _ = self.device.shell_nocheck(test_empty_cmd)
-
-                self.assertEqual(rc, 0)
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        @unittest.skipIf(sys.platform == "win32", "symlinks require elevated privileges on windows")
-        def test_push_symlink(self):
-            """Push a symlink.
-
-            Bug: http://b/31491920
-            """
-            try:
-                host_dir = tempfile.mkdtemp()
-
-                # Make sure the temp directory isn't setuid, or else adb will
-                # complain.
-                os.chmod(host_dir, 0o700)
-
-                with open(os.path.join(host_dir, 'foo'), 'w') as f:
-                    f.write('foo')
-
-                symlink_path = os.path.join(host_dir, 'symlink')
-                os.symlink('foo', symlink_path)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
-                self.device.push(symlink_path, self.DEVICE_TEMP_DIR)
-                rc, out, _ = self.device.shell_nocheck(
-                    ['cat', posixpath.join(self.DEVICE_TEMP_DIR, 'symlink')])
-                self.assertEqual(0, rc)
-                self.assertEqual(out.strip(), 'foo')
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        def test_multiple_push(self):
-            """Push multiple files to the device in one adb push command.
-
-            Bug: http://b/25324823
-            """
+            symlink_path = os.path.join(host_dir, 'symlink')
+            os.symlink('foo', symlink_path)
 
             self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
             self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
+            self.device.push(symlink_path, self.DEVICE_TEMP_DIR)
+            rc, out, _ = self.device.shell_nocheck(
+                ['cat', posixpath.join(self.DEVICE_TEMP_DIR, 'symlink')])
+            self.assertEqual(0, rc)
+            self.assertEqual(out.strip(), 'foo')
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
+    def test_multiple_push(self):
+        """Push multiple files to the device in one adb push command.
+
+        Bug: http://b/25324823
+        """
+
+        self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        self.device.shell(['mkdir', self.DEVICE_TEMP_DIR])
+
+        try:
+            host_dir = tempfile.mkdtemp()
+
+            # Create some random files and a subdirectory containing more files.
+            temp_files = make_random_host_files(in_dir=host_dir, num_files=4)
+
+            subdir = os.path.join(host_dir, 'subdir')
+            os.mkdir(subdir)
+            subdir_temp_files = make_random_host_files(in_dir=subdir,
+                                                       num_files=4)
+
+            paths = [x.full_path for x in temp_files]
+            paths.append(subdir)
+            self.device._simple_call(['push'] + paths + [self.DEVICE_TEMP_DIR])
+
+            for temp_file in temp_files:
+                remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
+                                             temp_file.base_name)
+                self._verify_remote(temp_file.checksum, remote_path)
+
+            for subdir_temp_file in subdir_temp_files:
+                remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
+                                             # BROKEN: http://b/25394682
+                                             # 'subdir';
+                                             temp_file.base_name)
+                self._verify_remote(temp_file.checksum, remote_path)
+
+
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
+
+    @requires_non_root
+    def test_push_error_reporting(self):
+        """Make sure that errors that occur while pushing a file get reported
+
+        Bug: http://b/26816782
+        """
+        with tempfile.NamedTemporaryFile() as tmp_file:
+            tmp_file.write(b'\0' * 1024 * 1024)
+            tmp_file.flush()
             try:
-                host_dir = tempfile.mkdtemp()
-
-                # Create some random files and a subdirectory containing more files.
-                temp_files = make_random_host_files(in_dir=host_dir, num_files=4)
-
-                subdir = os.path.join(host_dir, 'subdir')
-                os.mkdir(subdir)
-                subdir_temp_files = make_random_host_files(in_dir=subdir,
-                                                           num_files=4)
-
-                paths = [x.full_path for x in temp_files]
-                paths.append(subdir)
-                self.device._simple_call(['push'] + paths + [self.DEVICE_TEMP_DIR])
-
-                for temp_file in temp_files:
-                    remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
-                                                 temp_file.base_name)
-                    self._verify_remote(temp_file.checksum, remote_path)
-
-                for subdir_temp_file in subdir_temp_files:
-                    remote_path = posixpath.join(self.DEVICE_TEMP_DIR,
-                                                 # BROKEN: http://b/25394682
-                                                 # 'subdir';
-                                                 temp_file.base_name)
-                    self._verify_remote(temp_file.checksum, remote_path)
-
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        @requires_non_root
-        def test_push_error_reporting(self):
-            """Make sure that errors that occur while pushing a file get reported
-
-            Bug: http://b/26816782
-            """
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                tmp_file.write(b'\0' * 1024 * 1024)
-                tmp_file.flush()
-                try:
-                    self.device.push(local=tmp_file.name, remote='/system/')
-                    self.fail('push should not have succeeded')
-                except subprocess.CalledProcessError as e:
-                    output = e.output
-
-                self.assertTrue(b'Permission denied' in output or
-                                b'Read-only file system' in output)
-
-        @requires_non_root
-        def test_push_directory_creation(self):
-            """Regression test for directory creation.
-
-            Bug: http://b/110953234
-            """
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                tmp_file.write(b'\0' * 1024 * 1024)
-                tmp_file.flush()
-                remote_path = self.DEVICE_TEMP_DIR + '/test_push_directory_creation'
-                self.device.shell(['rm', '-rf', remote_path])
-
-                remote_path += '/filename'
-                self.device.push(local=tmp_file.name, remote=remote_path)
-
-        def disabled_test_push_multiple_slash_root(self):
-            """Regression test for pushing to //data/local/tmp.
-
-            Bug: http://b/141311284
-
-            Disabled because this broken on the adbd side as well: b/141943968
-            """
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                tmp_file.write('\0' * 1024 * 1024)
-                tmp_file.flush()
-                remote_path = '/' + self.DEVICE_TEMP_DIR + '/test_push_multiple_slash_root'
-                self.device.shell(['rm', '-rf', remote_path])
-                self.device.push(local=tmp_file.name, remote=remote_path)
-
-        def _test_pull(self, remote_file, checksum):
-            tmp_write = tempfile.NamedTemporaryFile(mode='wb', delete=False)
-            tmp_write.close()
-            self.device.pull(remote=remote_file, local=tmp_write.name)
-            with open(tmp_write.name, 'rb') as tmp_read:
-                host_contents = tmp_read.read()
-                host_md5 = compute_md5(host_contents)
-            self.assertEqual(checksum, host_md5)
-            os.remove(tmp_write.name)
-
-        @requires_non_root
-        def test_pull_error_reporting(self):
-            self.device.shell(['touch', self.DEVICE_TEMP_FILE])
-            self.device.shell(['chmod', 'a-rwx', self.DEVICE_TEMP_FILE])
-
-            try:
-                output = self.device.pull(remote=self.DEVICE_TEMP_FILE, local='x')
+                self.device.push(local=tmp_file.name, remote='/system/')
+                self.fail('push should not have succeeded')
             except subprocess.CalledProcessError as e:
                 output = e.output
 
-            self.assertIn(b'Permission denied', output)
+            self.assertTrue(b'Permission denied' in output or
+                            b'Read-only file system' in output)
 
-            self.device.shell(['rm', '-f', self.DEVICE_TEMP_FILE])
+    @requires_non_root
+    def test_push_directory_creation(self):
+        """Regression test for directory creation.
 
-        def test_pull(self):
-            """Pull a randomly generated file from specified device."""
-            kbytes = 512
-            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_FILE])
-            cmd = ['dd', 'if=/dev/urandom',
-                   'of={}'.format(self.DEVICE_TEMP_FILE), 'bs=1024',
-                   'count={}'.format(kbytes)]
-            self.device.shell(cmd)
-            dev_md5, _ = self.device.shell(
-                [get_md5_prog(self.device), self.DEVICE_TEMP_FILE])[0].split()
-            self._test_pull(self.DEVICE_TEMP_FILE, dev_md5)
-            self.device.shell_nocheck(['rm', self.DEVICE_TEMP_FILE])
+        Bug: http://b/110953234
+        """
+        with tempfile.NamedTemporaryFile() as tmp_file:
+            tmp_file.write(b'\0' * 1024 * 1024)
+            tmp_file.flush()
+            remote_path = self.DEVICE_TEMP_DIR + '/test_push_directory_creation'
+            self.device.shell(['rm', '-rf', remote_path])
 
-        def test_pull_dir(self):
-            """Pull a randomly generated directory of files from the device."""
-            try:
-                host_dir = tempfile.mkdtemp()
+            remote_path += '/filename'
+            self.device.push(local=tmp_file.name, remote=remote_path)
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
+    def disabled_test_push_multiple_slash_root(self):
+        """Regression test for pushing to //data/local/tmp.
 
-                # Populate device directory with random files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
+        Bug: http://b/141311284
 
-                self.device.pull(remote=self.DEVICE_TEMP_DIR, local=host_dir)
+        Disabled because this broken on the adbd side as well: b/141943968
+        """
+        with tempfile.NamedTemporaryFile() as tmp_file:
+            tmp_file.write('\0' * 1024 * 1024)
+            tmp_file.flush()
+            remote_path = '/' + self.DEVICE_TEMP_DIR + '/test_push_multiple_slash_root'
+            self.device.shell(['rm', '-rf', remote_path])
+            self.device.push(local=tmp_file.name, remote=remote_path)
 
-                for temp_file in temp_files:
-                    host_path = os.path.join(
-                        host_dir, posixpath.basename(self.DEVICE_TEMP_DIR),
-                        temp_file.base_name)
-                    self._verify_local(temp_file.checksum, host_path)
+    def _test_pull(self, remote_file, checksum):
+        tmp_write = tempfile.NamedTemporaryFile(mode='wb', delete=False)
+        tmp_write.close()
+        self.device.pull(remote=remote_file, local=tmp_write.name)
+        with open(tmp_write.name, 'rb') as tmp_read:
+            host_contents = tmp_read.read()
+            host_md5 = compute_md5(host_contents)
+        self.assertEqual(checksum, host_md5)
+        os.remove(tmp_write.name)
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
+    @requires_non_root
+    def test_pull_error_reporting(self):
+        self.device.shell(['touch', self.DEVICE_TEMP_FILE])
+        self.device.shell(['chmod', 'a-rwx', self.DEVICE_TEMP_FILE])
 
-        def test_pull_dir_symlink(self):
-            """Pull a directory into a symlink to a directory.
+        try:
+            output = self.device.pull(remote=self.DEVICE_TEMP_FILE, local='x')
+        except subprocess.CalledProcessError as e:
+            output = e.output
 
-            Bug: http://b/27362811
-            """
-            if os.name != 'posix':
-                raise unittest.SkipTest('requires POSIX')
+        self.assertIn(b'Permission denied', output)
 
-            try:
-                host_dir = tempfile.mkdtemp()
-                real_dir = os.path.join(host_dir, 'dir')
-                symlink = os.path.join(host_dir, 'symlink')
-                os.mkdir(real_dir)
-                os.symlink(real_dir, symlink)
+        self.device.shell(['rm', '-f', self.DEVICE_TEMP_FILE])
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
+    def test_pull(self):
+        """Pull a randomly generated file from specified device."""
+        kbytes = 512
+        self.device.shell(['rm', '-rf', self.DEVICE_TEMP_FILE])
+        cmd = ['dd', 'if=/dev/urandom',
+               'of={}'.format(self.DEVICE_TEMP_FILE), 'bs=1024',
+               'count={}'.format(kbytes)]
+        self.device.shell(cmd)
+        dev_md5, _ = self.device.shell(
+            [get_md5_prog(self.device), self.DEVICE_TEMP_FILE])[0].split()
+        self._test_pull(self.DEVICE_TEMP_FILE, dev_md5)
+        self.device.shell_nocheck(['rm', self.DEVICE_TEMP_FILE])
 
-                # Populate device directory with random files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
+    def test_pull_dir(self):
+        """Pull a randomly generated directory of files from the device."""
+        try:
+            host_dir = tempfile.mkdtemp()
 
-                self.device.pull(remote=self.DEVICE_TEMP_DIR, local=symlink)
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
 
-                for temp_file in temp_files:
-                    host_path = os.path.join(
-                        real_dir, posixpath.basename(self.DEVICE_TEMP_DIR),
-                        temp_file.base_name)
-                    self._verify_local(temp_file.checksum, host_path)
+            # Populate device directory with random files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
+            self.device.pull(remote=self.DEVICE_TEMP_DIR, local=host_dir)
 
-        def test_pull_dir_symlink_collision(self):
-            """Pull a directory into a colliding symlink to directory."""
-            if os.name != 'posix':
-                raise unittest.SkipTest('requires POSIX')
-
-            try:
-                host_dir = tempfile.mkdtemp()
-                real_dir = os.path.join(host_dir, 'real')
-                tmp_dirname = os.path.basename(self.DEVICE_TEMP_DIR)
-                symlink = os.path.join(host_dir, tmp_dirname)
-                os.mkdir(real_dir)
-                os.symlink(real_dir, symlink)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
-
-                # Populate device directory with random files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
-
-                self.device.pull(remote=self.DEVICE_TEMP_DIR, local=host_dir)
-
-                for temp_file in temp_files:
-                    host_path = os.path.join(real_dir, temp_file.base_name)
-                    self._verify_local(temp_file.checksum, host_path)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        def test_pull_dir_nonexistent(self):
-            """Pull a directory of files from the device to a nonexistent path."""
-            try:
-                host_dir = tempfile.mkdtemp()
-                dest_dir = os.path.join(host_dir, 'dest')
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
-
-                # Populate device directory with random files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
-
-                self.device.pull(remote=self.DEVICE_TEMP_DIR, local=dest_dir)
-
-                for temp_file in temp_files:
-                    host_path = os.path.join(dest_dir, temp_file.base_name)
-                    self._verify_local(temp_file.checksum, host_path)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        # selinux prevents adbd from accessing symlinks on /data/local/tmp.
-        def disabled_test_pull_symlink_dir(self):
-            """Pull a symlink to a directory of symlinks to files."""
-            try:
-                host_dir = tempfile.mkdtemp()
-
-                remote_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'contents')
-                remote_links = posixpath.join(self.DEVICE_TEMP_DIR, 'links')
-                remote_symlink = posixpath.join(self.DEVICE_TEMP_DIR, 'symlink')
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', remote_dir, remote_links])
-                self.device.shell(['ln', '-s', remote_links, remote_symlink])
-
-                # Populate device directory with random files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=remote_dir, num_files=32)
-
-                for temp_file in temp_files:
-                    self.device.shell(
-                        ['ln', '-s', '../contents/{}'.format(temp_file.base_name),
-                         posixpath.join(remote_links, temp_file.base_name)])
-
-                self.device.pull(remote=remote_symlink, local=host_dir)
-
-                for temp_file in temp_files:
-                    host_path = os.path.join(
-                        host_dir, 'symlink', temp_file.base_name)
-                    self._verify_local(temp_file.checksum, host_path)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        def test_pull_empty(self):
-            """Pull a directory containing an empty directory from the device."""
-            try:
-                host_dir = tempfile.mkdtemp()
-
-                remote_empty_path = posixpath.join(self.DEVICE_TEMP_DIR, 'empty')
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', remote_empty_path])
-
-                self.device.pull(remote=remote_empty_path, local=host_dir)
-                self.assertTrue(os.path.isdir(os.path.join(host_dir, 'empty')))
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        def test_multiple_pull(self):
-            """Pull a randomly generated directory of files from the device."""
-
-            try:
-                host_dir = tempfile.mkdtemp()
-
-                subdir = posixpath.join(self.DEVICE_TEMP_DIR, 'subdir')
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                self.device.shell(['mkdir', '-p', subdir])
-
-                # Create some random files and a subdirectory containing more files.
-                temp_files = make_random_device_files(
-                    self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=4)
-
-                subdir_temp_files = make_random_device_files(
-                    self.device, in_dir=subdir, num_files=4, prefix='subdir_')
-
-                paths = [x.full_path for x in temp_files]
-                paths.append(subdir)
-                self.device._simple_call(['pull'] + paths + [host_dir])
-
-                for temp_file in temp_files:
-                    local_path = os.path.join(host_dir, temp_file.base_name)
-                    self._verify_local(temp_file.checksum, local_path)
-
-                for subdir_temp_file in subdir_temp_files:
-                    local_path = os.path.join(host_dir,
-                                              'subdir',
-                                              subdir_temp_file.base_name)
-                    self._verify_local(subdir_temp_file.checksum, local_path)
-
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if host_dir is not None:
-                    shutil.rmtree(host_dir)
-
-        def verify_sync(self, device, temp_files, device_dir):
-            """Verifies that a list of temp files was synced to the device."""
-            # Confirm that every file on the device mirrors that on the host.
             for temp_file in temp_files:
-                device_full_path = posixpath.join(
-                    device_dir, temp_file.base_name)
-                dev_md5, _ = device.shell(
-                    [get_md5_prog(self.device), device_full_path])[0].split()
-                self.assertEqual(temp_file.checksum, dev_md5)
+                host_path = os.path.join(
+                    host_dir, posixpath.basename(self.DEVICE_TEMP_DIR),
+                    temp_file.base_name)
+                self._verify_local(temp_file.checksum, host_path)
 
-        def test_sync(self):
-            """Sync a host directory to the data partition."""
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-            try:
-                base_dir = tempfile.mkdtemp()
+    def test_pull_dir_symlink(self):
+        """Pull a directory into a symlink to a directory.
 
-                # Create mirror device directory hierarchy within base_dir.
-                full_dir_path = base_dir + self.DEVICE_TEMP_DIR
-                os.makedirs(full_dir_path)
+        Bug: http://b/27362811
+        """
+        if os.name != 'posix':
+            raise unittest.SkipTest('requires POSIX')
 
-                # Create 32 random files within the host mirror.
-                temp_files = make_random_host_files(
-                    in_dir=full_dir_path, num_files=32)
+        try:
+            host_dir = tempfile.mkdtemp()
+            real_dir = os.path.join(host_dir, 'dir')
+            symlink = os.path.join(host_dir, 'symlink')
+            os.mkdir(real_dir)
+            os.symlink(real_dir, symlink)
 
-                # Clean up any stale files on the device.
-                device = adb.get_device()  # pylint: disable=no-member
-                device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
 
-                old_product_out = os.environ.get('ANDROID_PRODUCT_OUT')
-                os.environ['ANDROID_PRODUCT_OUT'] = base_dir
-                device.sync('data')
-                if old_product_out is None:
-                    del os.environ['ANDROID_PRODUCT_OUT']
-                else:
-                    os.environ['ANDROID_PRODUCT_OUT'] = old_product_out
+            # Populate device directory with random files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
 
-                self.verify_sync(device, temp_files, self.DEVICE_TEMP_DIR)
+            self.device.pull(remote=self.DEVICE_TEMP_DIR, local=symlink)
 
-                #self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if base_dir is not None:
-                    shutil.rmtree(base_dir)
+            for temp_file in temp_files:
+                host_path = os.path.join(
+                    real_dir, posixpath.basename(self.DEVICE_TEMP_DIR),
+                    temp_file.base_name)
+                self._verify_local(temp_file.checksum, host_path)
 
-        def test_push_sync(self):
-            """Sync a host directory to a specific path."""
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-            try:
-                temp_dir = tempfile.mkdtemp()
-                temp_files = make_random_host_files(in_dir=temp_dir, num_files=32)
+    def test_pull_dir_symlink_collision(self):
+        """Pull a directory into a colliding symlink to directory."""
+        if os.name != 'posix':
+            raise unittest.SkipTest('requires POSIX')
 
-                device_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'sync_src_dst')
+        try:
+            host_dir = tempfile.mkdtemp()
+            real_dir = os.path.join(host_dir, 'real')
+            tmp_dirname = os.path.basename(self.DEVICE_TEMP_DIR)
+            symlink = os.path.join(host_dir, tmp_dirname)
+            os.mkdir(real_dir)
+            os.symlink(real_dir, symlink)
 
-                # Clean up any stale files on the device.
-                device = adb.get_device()  # pylint: disable=no-member
-                device.shell(['rm', '-rf', device_dir])
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
 
-                device.push(temp_dir, device_dir, sync=True)
+            # Populate device directory with random files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
 
-                self.verify_sync(device, temp_files, device_dir)
+            self.device.pull(remote=self.DEVICE_TEMP_DIR, local=host_dir)
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if temp_dir is not None:
-                    shutil.rmtree(temp_dir)
+            for temp_file in temp_files:
+                host_path = os.path.join(real_dir, temp_file.base_name)
+                self._verify_local(temp_file.checksum, host_path)
 
-        def test_push_sync_multiple(self):
-            """Sync multiple host directories to a specific path."""
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-            try:
-                temp_dir = tempfile.mkdtemp()
-                temp_files = make_random_host_files(in_dir=temp_dir, num_files=32)
+    def test_pull_dir_nonexistent(self):
+        """Pull a directory of files from the device to a nonexistent path."""
+        try:
+            host_dir = tempfile.mkdtemp()
+            dest_dir = os.path.join(host_dir, 'dest')
 
-                device_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'sync_src_dst')
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', self.DEVICE_TEMP_DIR])
 
-                # Clean up any stale files on the device.
-                device = adb.get_device()  # pylint: disable=no-member
-                device.shell(['rm', '-rf', device_dir])
-                device.shell(['mkdir', '-p', device_dir])
+            # Populate device directory with random files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=32)
 
-                host_paths = [os.path.join(temp_dir, x.base_name) for x in temp_files]
-                device.push(host_paths, device_dir, sync=True)
+            self.device.pull(remote=self.DEVICE_TEMP_DIR, local=dest_dir)
 
-                self.verify_sync(device, temp_files, device_dir)
+            for temp_file in temp_files:
+                host_path = os.path.join(dest_dir, temp_file.base_name)
+                self._verify_local(temp_file.checksum, host_path)
 
-                self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-            finally:
-                if temp_dir is not None:
-                    shutil.rmtree(temp_dir)
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
+    # selinux prevents adbd from accessing symlinks on /data/local/tmp.
+    def disabled_test_pull_symlink_dir(self):
+        """Pull a symlink to a directory of symlinks to files."""
+        try:
+            host_dir = tempfile.mkdtemp()
 
-        def test_push_dry_run_nonexistent_file(self):
-            """Push with dry run."""
+            remote_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'contents')
+            remote_links = posixpath.join(self.DEVICE_TEMP_DIR, 'links')
+            remote_symlink = posixpath.join(self.DEVICE_TEMP_DIR, 'symlink')
 
-            for file_size in [8, 1024 * 1024]:
-                try:
-                    device_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'push_dry_run')
-                    device_file = posixpath.join(device_dir, 'file')
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', remote_dir, remote_links])
+            self.device.shell(['ln', '-s', remote_links, remote_symlink])
 
-                    self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                    self.device.shell(['mkdir', '-p', device_dir])
+            # Populate device directory with random files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=remote_dir, num_files=32)
 
-                    host_dir = tempfile.mkdtemp()
-                    host_file = posixpath.join(host_dir, 'file')
+            for temp_file in temp_files:
+                self.device.shell(
+                    ['ln', '-s', '../contents/{}'.format(temp_file.base_name),
+                     posixpath.join(remote_links, temp_file.base_name)])
 
-                    with open(host_file, "w") as f:
-                        f.write('x' * file_size)
+            self.device.pull(remote=remote_symlink, local=host_dir)
 
-                    self.device._simple_call(['push', '-n', host_file, device_file])
-                    rc, _, _ = self.device.shell_nocheck(['[', '-e', device_file, ']'])
-                    self.assertNotEqual(0, rc)
+            for temp_file in temp_files:
+                host_path = os.path.join(
+                    host_dir, 'symlink', temp_file.base_name)
+                self._verify_local(temp_file.checksum, host_path)
 
-                    self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                finally:
-                    if host_dir is not None:
-                        shutil.rmtree(host_dir)
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-        def test_push_dry_run_existent_file(self):
-            """Push with dry run."""
+    def test_pull_empty(self):
+        """Pull a directory containing an empty directory from the device."""
+        try:
+            host_dir = tempfile.mkdtemp()
 
-            for file_size in [8, 1024 * 1024]:
-                try:
-                    device_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'push_dry_run')
-                    device_file = posixpath.join(device_dir, 'file')
+            remote_empty_path = posixpath.join(self.DEVICE_TEMP_DIR, 'empty')
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', remote_empty_path])
 
-                    self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                    self.device.shell(['mkdir', '-p', device_dir])
-                    self.device.shell(['echo', 'foo', '>', device_file])
+            self.device.pull(remote=remote_empty_path, local=host_dir)
+            self.assertTrue(os.path.isdir(os.path.join(host_dir, 'empty')))
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
-                    host_dir = tempfile.mkdtemp()
-                    host_file = posixpath.join(host_dir, 'file')
+    def test_multiple_pull(self):
+        """Pull a randomly generated directory of files from the device."""
 
-                    with open(host_file, "w") as f:
-                        f.write('x' * file_size)
+        try:
+            host_dir = tempfile.mkdtemp()
 
-                    self.device._simple_call(['push', '-n', host_file, device_file])
-                    stdout, stderr = self.device.shell(['cat', device_file])
-                    self.assertEqual(stdout.strip(), "foo")
+            subdir = posixpath.join(self.DEVICE_TEMP_DIR, 'subdir')
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+            self.device.shell(['mkdir', '-p', subdir])
 
-                    self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
-                finally:
-                    if host_dir is not None:
-                        shutil.rmtree(host_dir)
+            # Create some random files and a subdirectory containing more files.
+            temp_files = make_random_device_files(
+                self.device, in_dir=self.DEVICE_TEMP_DIR, num_files=4)
 
-        def test_unicode_paths(self):
-            """Ensure that we can support non-ASCII paths, even on Windows."""
-            name = u'로보카 폴리'
+            subdir_temp_files = make_random_device_files(
+                self.device, in_dir=subdir, num_files=4, prefix='subdir_')
 
-            self.device.shell(['rm', '-f', '/data/local/tmp/adb-test-*'])
-            remote_path = u'/data/local/tmp/adb-test-{}'.format(name)
+            paths = [x.full_path for x in temp_files]
+            paths.append(subdir)
+            self.device._simple_call(['pull'] + paths + [host_dir])
 
-            ## push.
-            tf = tempfile.NamedTemporaryFile('wb', suffix=name, delete=False)
-            tf.close()
-            self.device.push(tf.name, remote_path)
-            os.remove(tf.name)
-            self.assertFalse(os.path.exists(tf.name))
+            for temp_file in temp_files:
+                local_path = os.path.join(host_dir, temp_file.base_name)
+                self._verify_local(temp_file.checksum, local_path)
 
-            # Verify that the device ended up with the expected UTF-8 path
-            output = self.device.shell(
-                    ['ls', '/data/local/tmp/adb-test-*'])[0].strip()
-            self.assertEqual(remote_path, output)
+            for subdir_temp_file in subdir_temp_files:
+                local_path = os.path.join(host_dir,
+                                          'subdir',
+                                          subdir_temp_file.base_name)
+                self._verify_local(subdir_temp_file.checksum, local_path)
 
-            # pull.
-            self.device.pull(remote_path, tf.name)
-            self.assertTrue(os.path.exists(tf.name))
-            os.remove(tf.name)
-            self.device.shell(['rm', '-f', '/data/local/tmp/adb-test-*'])
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if host_dir is not None:
+                shutil.rmtree(host_dir)
 
+    def verify_sync(self, device, temp_files, device_dir):
+        """Verifies that a list of temp files was synced to the device."""
+        # Confirm that every file on the device mirrors that on the host.
+        for temp_file in temp_files:
+            device_full_path = posixpath.join(
+                device_dir, temp_file.base_name)
+            dev_md5, _ = device.shell(
+                [get_md5_prog(self.device), device_full_path])[0].split()
+            self.assertEqual(temp_file.checksum, dev_md5)
 
-class FileOperationsTestUncompressed(FileOperationsTest.Base):
-    compression = "none"
+    def test_sync(self):
+        """Sync a host directory to the data partition."""
 
+        try:
+            base_dir = tempfile.mkdtemp()
 
-class FileOperationsTestBrotli(FileOperationsTest.Base):
-    compression = "brotli"
+            # Create mirror device directory hierarchy within base_dir.
+            full_dir_path = base_dir + self.DEVICE_TEMP_DIR
+            os.makedirs(full_dir_path)
 
+            # Create 32 random files within the host mirror.
+            temp_files = make_random_host_files(
+                in_dir=full_dir_path, num_files=32)
 
-class FileOperationsTestLZ4(FileOperationsTest.Base):
-    compression = "lz4"
+            # Clean up any stale files on the device.
+            device = adb.get_device()  # pylint: disable=no-member
+            device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
 
+            old_product_out = os.environ.get('ANDROID_PRODUCT_OUT')
+            os.environ['ANDROID_PRODUCT_OUT'] = base_dir
+            device.sync('data')
+            if old_product_out is None:
+                del os.environ['ANDROID_PRODUCT_OUT']
+            else:
+                os.environ['ANDROID_PRODUCT_OUT'] = old_product_out
 
-class FileOperationsTestZstd(FileOperationsTest.Base):
-    compression = "zstd"
+            self.verify_sync(device, temp_files, self.DEVICE_TEMP_DIR)
+
+            #self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if base_dir is not None:
+                shutil.rmtree(base_dir)
+
+    def test_push_sync(self):
+        """Sync a host directory to a specific path."""
+
+        try:
+            temp_dir = tempfile.mkdtemp()
+            temp_files = make_random_host_files(in_dir=temp_dir, num_files=32)
+
+            device_dir = posixpath.join(self.DEVICE_TEMP_DIR, 'sync_src_dst')
+
+            # Clean up any stale files on the device.
+            device = adb.get_device()  # pylint: disable=no-member
+            device.shell(['rm', '-rf', device_dir])
+
+            device.push(temp_dir, device_dir, sync=True)
+
+            self.verify_sync(device, temp_files, device_dir)
+
+            self.device.shell(['rm', '-rf', self.DEVICE_TEMP_DIR])
+        finally:
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir)
+
+    def test_unicode_paths(self):
+        """Ensure that we can support non-ASCII paths, even on Windows."""
+        name = u'로보카 폴리'
+
+        self.device.shell(['rm', '-f', '/data/local/tmp/adb-test-*'])
+        remote_path = u'/data/local/tmp/adb-test-{}'.format(name)
+
+        ## push.
+        tf = tempfile.NamedTemporaryFile('wb', suffix=name, delete=False)
+        tf.close()
+        self.device.push(tf.name, remote_path)
+        os.remove(tf.name)
+        self.assertFalse(os.path.exists(tf.name))
+
+        # Verify that the device ended up with the expected UTF-8 path
+        output = self.device.shell(
+                ['ls', '/data/local/tmp/adb-test-*'])[0].strip()
+        self.assertEqual(remote_path, output)
+
+        # pull.
+        self.device.pull(remote_path, tf.name)
+        self.assertTrue(os.path.exists(tf.name))
+        os.remove(tf.name)
+        self.device.shell(['rm', '-f', '/data/local/tmp/adb-test-*'])
 
 
 class DeviceOfflineTest(DeviceTest):

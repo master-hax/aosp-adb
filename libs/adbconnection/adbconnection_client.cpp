@@ -27,10 +27,7 @@
 
 #include <android-base/cmsg.h>
 #include <android-base/logging.h>
-#include <android-base/properties.h>
 #include <android-base/unique_fd.h>
-
-#include "adbconnection/process_info.h"
 
 using android::base::unique_fd;
 
@@ -63,8 +60,6 @@ AdbConnectionClientContext* adbconnection_client_new(
 
   std::optional<uint64_t> pid;
   std::optional<bool> debuggable;
-  std::optional<bool> profileable;
-  std::optional<std::string> architecture;
 
   for (size_t i = 0; i < info_count; ++i) {
     auto info = info_elems[i];
@@ -82,23 +77,7 @@ AdbConnectionClientContext* adbconnection_client_new(
           LOG(ERROR) << "multiple debuggable entries in AdbConnectionClientInfo, ignoring";
           continue;
         }
-        debuggable = info->data.debuggable;
-        break;
-
-      case AdbConnectionClientInfoType::profileable:
-        if (profileable) {
-          LOG(ERROR) << "multiple profileable entries in AdbConnectionClientInfo, ignoring";
-          continue;
-        }
-        profileable = info->data.profileable;
-        break;
-
-      case AdbConnectionClientInfoType::architecture:
-        if (architecture) {
-          LOG(ERROR) << "multiple architecture entries in AdbConnectionClientInfo, ignoring";
-          continue;
-        }
-        architecture = std::string(info->data.architecture.name, info->data.architecture.size);
+        debuggable = info->data.pid;
         break;
     }
   }
@@ -113,37 +92,11 @@ AdbConnectionClientContext* adbconnection_client_new(
     return nullptr;
   }
 
-  bool expectProfileableAndArch = false;
-#if defined(__BIONIC__)
-  expectProfileableAndArch = android_get_device_api_level() >= __ANDROID_API_S__;
-#endif
-  if (expectProfileableAndArch) {
-    if (!profileable) {
-      LOG(ERROR) << "AdbConnectionClientInfo missing required field profileable";
-      return nullptr;
-    }
-
-    if (!architecture) {
-      LOG(ERROR) << "AdbConnectionClientInfo missing required field architecture";
-      return nullptr;
-    }
-  }
-
   ctx->control_socket_.reset(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
   if (ctx->control_socket_ < 0) {
     PLOG(ERROR) << "failed to create Unix domain socket";
     return nullptr;
   }
-
-#if defined(__ANDROID__)
-  // It's possible that adbd isn't running at this point.
-  // We don't want to just blindly connect, because if there's nothing listening, we'll end up
-  // waking up every second and preventing the CPU from going to sleep.
-  if (!android::base::WaitForProperty("init.svc.adbd", "running")) {
-    LOG(ERROR) << "adbd isn't running";
-    return nullptr;
-  }
-#endif
 
   struct timeval timeout;
   timeout.tv_sec = 1;
@@ -157,13 +110,7 @@ AdbConnectionClientContext* adbconnection_client_new(
 
   int rc = connect(ctx->control_socket_.get(), reinterpret_cast<sockaddr*>(&addr), addr_len);
   if (rc != 0) {
-    if (errno == ECONNREFUSED) {
-      // On userdebug devices, every Java process is debuggable, so if adbd is explicitly turned
-      // off, this would spew enormous amounts of red-herring errors.
-      LOG(DEBUG) << "failed to connect to jdwp control socket, adbd not running?";
-    } else {
-      PLOG(ERROR) << "failed to connect to jdwp control socket";
-    }
+    PLOG(ERROR) << "failed to connect to jdwp control socket";
     return nullptr;
   }
 
@@ -173,10 +120,10 @@ AdbConnectionClientContext* adbconnection_client_new(
     return nullptr;
   }
 
-  ProcessInfo process(*pid, *debuggable, *profileable, *architecture);
-  rc = TEMP_FAILURE_RETRY(write(ctx->control_socket_.get(), &process, sizeof(process)));
-  if (rc != sizeof(process)) {
-    PLOG(ERROR) << "failed to send JDWP process info to adbd";
+  uint32_t pid_u32 = static_cast<uint32_t>(*pid);
+  rc = TEMP_FAILURE_RETRY(write(ctx->control_socket_.get(), &pid_u32, sizeof(pid_u32)));
+  if (rc != sizeof(pid_u32)) {
+    PLOG(ERROR) << "failed to send JDWP process pid to adbd";
   }
 
   return ctx.release();

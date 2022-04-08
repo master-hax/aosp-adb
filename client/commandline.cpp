@@ -50,8 +50,6 @@
 #include <unistd.h>
 #endif
 
-#include <google/protobuf/text_format.h>
-
 #include "adb.h"
 #include "adb_auth.h"
 #include "adb_client.h"
@@ -59,7 +57,6 @@
 #include "adb_io.h"
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
-#include "app_processes.pb.h"
 #include "bugreport.h"
 #include "client/file_sync_client.h"
 #include "commandline.h"
@@ -104,8 +101,7 @@ static void help() {
         " connect HOST[:PORT]      connect to a device via TCP/IP [default port=5555]\n"
         " disconnect [HOST[:PORT]]\n"
         "     disconnect from given TCP/IP device [default port=5555], or all\n"
-        " pair HOST[:PORT] [PAIRING CODE]\n"
-        "     pair with a device for secure TCP/IP communication\n"
+        " pair HOST[:PORT]         pair with a device for secure TCP/IP communication\n"
         " forward --list           list all forward socket connections\n"
         " forward [--no-rebind] LOCAL REMOTE\n"
         "     forward socket connection using:\n"
@@ -115,7 +111,6 @@ static void help() {
         "       localfilesystem:<unix domain socket name>\n"
         "       dev:<character device name>\n"
         "       jdwp:<process pid> (remote only)\n"
-        "       vsock:<CID>:<port> (remote only)\n"
         "       acceptfd:<fd> (listen only)\n"
         " forward --remove LOCAL   remove specific forward socket connection\n"
         " forward --remove-all     remove all forward socket connections\n"
@@ -129,26 +124,22 @@ static void help() {
         "       localfilesystem:<unix domain socket name>\n"
         " reverse --remove REMOTE  remove specific reverse socket connection\n"
         " reverse --remove-all     remove all reverse socket connections from device\n"
-        " mdns check               check if mdns discovery is available\n"
-        " mdns services            list all discovered services\n"
         "\n"
         "file transfer:\n"
-        " push [--sync] [-z ALGORITHM] [-Z] LOCAL... REMOTE\n"
+        " push [--sync] [-zZ] LOCAL... REMOTE\n"
         "     copy local files/directories to device\n"
         "     --sync: only push files that are newer on the host than the device\n"
-        "     -n: dry run: push files to device without storing to the filesystem\n"
-        "     -z: enable compression with a specified algorithm (any, none, brotli)\n"
+        "     -z: enable compression\n"
         "     -Z: disable compression\n"
-        " pull [-a] [-z ALGORITHM] [-Z] REMOTE... LOCAL\n"
+        " pull [-azZ] REMOTE... LOCAL\n"
         "     copy files/dirs from device\n"
         "     -a: preserve file timestamp and mode\n"
-        "     -z: enable compression with a specified algorithm (any, none, brotli)\n"
+        "     -z: enable compression\n"
         "     -Z: disable compression\n"
-        " sync [-l] [-z ALGORITHM] [-Z] [all|data|odm|oem|product|system|system_ext|vendor]\n"
+        " sync [-lzZ] [all|data|odm|oem|product|system|system_ext|vendor]\n"
         "     sync a local build from $ANDROID_PRODUCT_OUT to the device (default all)\n"
-        "     -n: dry run: push files to device without storing to the filesystem\n"
         "     -l: list files that would be copied, but don't copy them\n"
-        "     -z: enable compression with a specified algorithm (any, none, brotli)\n"
+        "     -z: enable compression\n"
         "     -Z: disable compression\n"
         "\n"
         "shell:\n"
@@ -206,8 +197,8 @@ static void help() {
         "     generate adb public/private key; private key stored in FILE,\n"
         "\n"
         "scripting:\n"
-        " wait-for[-TRANSPORT]-STATE...\n"
-        "     wait for device to be in a given state\n"
+        " wait-for[-TRANSPORT]-STATE\n"
+        "     wait for device to be in the given state\n"
         "     STATE: device, recovery, rescue, sideload, bootloader, or disconnect\n"
         "     TRANSPORT: usb, local, or any [default=any]\n"
         " get-state                print offline | bootloader | device\n"
@@ -242,7 +233,6 @@ static void help() {
         " $ANDROID_SERIAL          serial number to connect to (see -s)\n"
         " $ANDROID_LOG_TAGS        tags to be used by logcat (see logcat --help)\n"
         " $ADB_LOCAL_TRANSPORT_MAX_PORT max emulator scan port (default 5585, 16 emus)\n"
-        " $ADB_MDNS_AUTO_CONNECT   comma-separated list of mdns services to allow auto-connect (default adb-tls-connect)\n"
     );
     // clang-format on
 }
@@ -677,17 +667,18 @@ static int RemoteShell(bool use_shell_protocol, const std::string& type_arg, cha
 }
 
 static int adb_shell(int argc, const char** argv) {
-    std::string error;
-    auto&& features = adb_get_feature_set(&error);
-    if (!features) {
-        error_exit("%s", error.c_str());
+    FeatureSet features;
+    std::string error_message;
+    if (!adb_get_feature_set(&features, &error_message)) {
+        fprintf(stderr, "error: %s\n", error_message.c_str());
+        return 1;
     }
 
     enum PtyAllocationMode { kPtyAuto, kPtyNo, kPtyYes, kPtyDefinitely };
 
     // Defaults.
-    char escape_char = '~';                                                 // -e
-    bool use_shell_protocol = CanUseFeature(*features, kFeatureShell2);     // -x
+    char escape_char = '~'; // -e
+    bool use_shell_protocol = CanUseFeature(features, kFeatureShell2); // -x
     PtyAllocationMode tty = use_shell_protocol ? kPtyAuto : kPtyDefinitely; // -t/-T
 
     // Parse shell-specific command-line options.
@@ -763,7 +754,7 @@ static int adb_shell(int argc, const char** argv) {
     if (!use_shell_protocol) {
         if (shell_type_arg != kShellServiceArgPty) {
             fprintf(stderr, "error: %s only supports allocating a pty\n",
-                    !CanUseFeature(*features, kFeatureShell2) ? "device" : "-x");
+                    !CanUseFeature(features, kFeatureShell2) ? "device" : "-x");
             return 1;
         } else {
             // If we're not using the shell protocol, the type argument must be empty.
@@ -783,13 +774,14 @@ static int adb_shell(int argc, const char** argv) {
 }
 
 static int adb_abb(int argc, const char** argv) {
-    std::string error;
-    auto&& features = adb_get_feature_set(&error);
-    if (!features) {
-        error_exit("%s", error.c_str());
+    FeatureSet features;
+    std::string error_message;
+    if (!adb_get_feature_set(&features, &error_message)) {
+        fprintf(stderr, "error: %s\n", error_message.c_str());
         return 1;
     }
-    if (!CanUseFeature(*features, kFeatureAbb)) {
+
+    if (!CanUseFeature(features, kFeatureAbb)) {
         error_exit("abb is not supported by the device");
     }
 
@@ -1068,16 +1060,17 @@ static int ppp(int argc, const char** argv) {
 static bool wait_for_device(const char* service,
                             std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
     std::vector<std::string> components = android::base::Split(service, "-");
-    if (components.size() < 3) {
+    if (components.size() < 3 || components.size() > 4) {
         fprintf(stderr, "adb: couldn't parse 'wait-for' command: %s\n", service);
         return false;
     }
 
-    // If the first thing after "wait-for-" wasn't a TRANSPORT, insert whatever
-    // the current transport implies.
-    if (components[2] != "usb" && components[2] != "local" && components[2] != "any") {
-        TransportType t;
-        adb_get_transport(&t, nullptr, nullptr);
+    TransportType t;
+    adb_get_transport(&t, nullptr, nullptr);
+
+    // Was the caller vague about what they'd like us to wait for?
+    // If so, check they weren't more specific in their choice of transport type.
+    if (components.size() == 3) {
         auto it = components.begin() + 2;
         if (t == kTransportUsb) {
             components.insert(it, "usb");
@@ -1086,9 +1079,23 @@ static bool wait_for_device(const char* service,
         } else {
             components.insert(it, "any");
         }
+    } else if (components[2] != "any" && components[2] != "local" && components[2] != "usb") {
+        fprintf(stderr, "adb: unknown type %s; expected 'any', 'local', or 'usb'\n",
+                components[2].c_str());
+        return false;
     }
 
-    // Stitch it back together and send it over...
+    if (components[3] != "any" && components[3] != "bootloader" && components[3] != "device" &&
+        components[3] != "recovery" && components[3] != "rescue" && components[3] != "sideload" &&
+        components[3] != "disconnect") {
+        fprintf(stderr,
+                "adb: unknown state %s; "
+                "expected 'any', 'bootloader', 'device', 'recovery', 'rescue', 'sideload', or "
+                "'disconnect'\n",
+                components[3].c_str());
+        return false;
+    }
+
     std::string cmd = format_host_command(android::base::Join(components, "-").c_str());
     if (timeout) {
         std::thread([timeout]() {
@@ -1150,7 +1157,7 @@ static bool adb_root(const char* command) {
     // If we were using a specific transport ID, there's nothing we can wait for.
     if (previous_id == 0) {
         adb_set_transport(previous_type, previous_serial, 0);
-        wait_for_device("wait-for-device", 12000ms);
+        wait_for_device("wait-for-device", 6000ms);
     }
 
     return true;
@@ -1167,9 +1174,10 @@ int send_shell_command(const std::string& command, bool disable_shell_protocol,
         // Use shell protocol if it's supported and the caller doesn't explicitly
         // disable it.
         if (!disable_shell_protocol) {
-            auto&& features = adb_get_feature_set(nullptr);
-            if (features) {
-                use_shell_protocol = CanUseFeature(*features, kFeatureShell2);
+            FeatureSet features;
+            std::string error;
+            if (adb_get_feature_set(&features, &error)) {
+                use_shell_protocol = CanUseFeature(features, kFeatureShell2);
             } else {
                 // Device was unreachable.
                 attempt_connection = false;
@@ -1318,38 +1326,12 @@ static int restore(int argc, const char** argv) {
     return 0;
 }
 
-static CompressionType parse_compression_type(const std::string& str, bool allow_numbers) {
-    if (allow_numbers) {
-        if (str == "0") {
-            return CompressionType::None;
-        } else if (str == "1") {
-            return CompressionType::Any;
-        }
-    }
-
-    if (str == "any") {
-        return CompressionType::Any;
-    } else if (str == "none") {
-        return CompressionType::None;
-    }
-
-    if (str == "brotli") {
-        return CompressionType::Brotli;
-    } else if (str == "lz4") {
-        return CompressionType::LZ4;
-    } else if (str == "zstd") {
-        return CompressionType::Zstd;
-    }
-
-    error_exit("unexpected compression type %s", str.c_str());
-}
-
 static void parse_push_pull_args(const char** arg, int narg, std::vector<const char*>* srcs,
-                                 const char** dst, bool* copy_attrs, bool* sync,
-                                 CompressionType* compression, bool* dry_run) {
+                                 const char** dst, bool* copy_attrs, bool* sync, bool* compressed) {
     *copy_attrs = false;
-    if (const char* adb_compression = getenv("ADB_COMPRESSION")) {
-        *compression = parse_compression_type(adb_compression, true);
+    const char* adb_compression = getenv("ADB_COMPRESSION");
+    if (adb_compression && strcmp(adb_compression, "0") == 0) {
+        *compressed = false;
     }
 
     srcs->clear();
@@ -1363,15 +1345,13 @@ static void parse_push_pull_args(const char** arg, int narg, std::vector<const c
             } else if (!strcmp(*arg, "-a")) {
                 *copy_attrs = true;
             } else if (!strcmp(*arg, "-z")) {
-                if (narg < 2) {
-                    error_exit("-z requires an argument");
+                if (compressed != nullptr) {
+                    *compressed = true;
                 }
-                *compression = parse_compression_type(*++arg, false);
-                --narg;
             } else if (!strcmp(*arg, "-Z")) {
-                *compression = CompressionType::None;
-            } else if (dry_run && !strcmp(*arg, "-n")) {
-                *dry_run = true;
+                if (compressed != nullptr) {
+                    *compressed = false;
+                }
             } else if (!strcmp(*arg, "--sync")) {
                 if (sync != nullptr) {
                     *sync = true;
@@ -1392,48 +1372,16 @@ static void parse_push_pull_args(const char** arg, int narg, std::vector<const c
     }
 }
 
-static int adb_connect_command(const std::string& command, TransportId* transport,
-                               StandardStreamsCallbackInterface* callback) {
+static int adb_connect_command(const std::string& command, TransportId* transport = nullptr) {
     std::string error;
     unique_fd fd(adb_connect(transport, command, &error));
     if (fd < 0) {
         fprintf(stderr, "error: %s\n", error.c_str());
         return 1;
     }
-    read_and_dump(fd, false, callback);
+    read_and_dump(fd);
     return 0;
 }
-
-static int adb_connect_command(const std::string& command, TransportId* transport = nullptr) {
-    return adb_connect_command(command, transport, &DEFAULT_STANDARD_STREAMS_CALLBACK);
-}
-
-// A class that prints out human readable form of the protobuf message for "track-app" service
-// (received in binary format).
-class TrackAppStreamsCallback : public DefaultStandardStreamsCallback {
-  public:
-    TrackAppStreamsCallback() : DefaultStandardStreamsCallback(nullptr, nullptr) {}
-
-    // Assume the buffer contains at least 4 bytes of valid data.
-    void OnStdout(const char* buffer, int length) override {
-        if (length < 4) return;  // Unexpected length received. Do nothing.
-
-        adb::proto::AppProcesses binary_proto;
-        // The first 4 bytes are the length of remaining content in hexadecimal format.
-        binary_proto.ParseFromString(std::string(buffer + 4, length - 4));
-        char summary[24];  // The following string includes digits and 16 fixed characters.
-        int written = snprintf(summary, sizeof(summary), "Process count: %d\n",
-                               binary_proto.process_size());
-        OnStream(nullptr, stdout, summary, written);
-
-        std::string string_proto;
-        google::protobuf::TextFormat::PrintToString(binary_proto, &string_proto);
-        OnStream(nullptr, stdout, string_proto.data(), string_proto.length());
-    }
-
-  private:
-    DISALLOW_COPY_AND_ASSIGN(TrackAppStreamsCallback);
-};
 
 static int adb_connect_command_bidirectional(const std::string& command) {
     std::string error;
@@ -1716,21 +1664,14 @@ int adb_commandline(int argc, const char** argv) {
         }
         printf("List of devices attached\n");
         return adb_query_command(query);
-    } else if (!strcmp(argv[0], "transport-id")) {
-        TransportId transport_id;
-        std::string error;
-        unique_fd fd(adb_connect(&transport_id, "host:features", &error, true));
-        if (fd == -1) {
-            error_exit("%s", error.c_str());
-        }
-        printf("%" PRIu64 "\n", transport_id);
-        return 0;
-    } else if (!strcmp(argv[0], "connect")) {
+    }
+    else if (!strcmp(argv[0], "connect")) {
         if (argc != 2) error_exit("usage: adb connect HOST[:PORT]");
 
         std::string query = android::base::StringPrintf("host:connect:%s", argv[1]);
         return adb_query_command(query);
-    } else if (!strcmp(argv[0], "disconnect")) {
+    }
+    else if (!strcmp(argv[0], "disconnect")) {
         if (argc > 2) error_exit("usage: adb disconnect [HOST[:PORT]]");
 
         std::string query = android::base::StringPrintf("host:disconnect:%s",
@@ -1739,17 +1680,13 @@ int adb_commandline(int argc, const char** argv) {
     } else if (!strcmp(argv[0], "abb")) {
         return adb_abb(argc, argv);
     } else if (!strcmp(argv[0], "pair")) {
-        if (argc < 2 || argc > 3) error_exit("usage: adb pair HOST[:PORT] [PAIRING CODE]");
+        if (argc != 2) error_exit("usage: adb pair <host>[:<port>]");
 
         std::string password;
-        if (argc == 2) {
-            printf("Enter pairing code: ");
-            fflush(stdout);
-            if (!std::getline(std::cin, password) || password.empty()) {
-                error_exit("No pairing code provided");
-            }
-        } else {
-            password = argv[2];
+        printf("Enter pairing code: ");
+        fflush(stdout);
+        if (!std::getline(std::cin, password) || password.empty()) {
+            error_exit("No pairing code provided");
         }
         std::string query =
                 android::base::StringPrintf("host:pair:%s:%s", password.c_str(), argv[1]);
@@ -1831,13 +1768,14 @@ int adb_commandline(int argc, const char** argv) {
         }
         return adb_connect_command(android::base::StringPrintf("tcpip:%d", port));
     } else if (!strcmp(argv[0], "remount")) {
+        FeatureSet features;
         std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
+        if (!adb_get_feature_set(&features, &error)) {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
         }
 
-        if (CanUseFeature(*features, kFeatureRemountShell)) {
+        if (CanUseFeature(features, kFeatureRemountShell)) {
             std::vector<const char*> args = {"shell"};
             args.insert(args.cend(), argv, argv + argc);
             return adb_shell_noinput(args.size(), args.data());
@@ -1928,29 +1866,6 @@ int adb_commandline(int argc, const char** argv) {
 
         ReadOrderlyShutdown(fd);
         return 0;
-    } else if (!strcmp(argv[0], "mdns")) {
-        --argc;
-        if (argc < 1) error_exit("mdns requires an argument");
-        ++argv;
-
-        std::string error;
-        if (!adb_check_server_version(&error)) {
-            error_exit("failed to check server version: %s", error.c_str());
-        }
-
-        std::string query = "host:mdns:";
-        if (!strcmp(argv[0], "check")) {
-            if (argc != 1) error_exit("mdns %s doesn't take any arguments", argv[0]);
-            query += "check";
-        } else if (!strcmp(argv[0], "services")) {
-            if (argc != 1) error_exit("mdns %s doesn't take any arguments", argv[0]);
-            query += "services";
-            printf("List of discovered mdns services\n");
-        } else {
-            error_exit("unknown mdns command [%s]", argv[0]);
-        }
-
-        return adb_query_command(query);
     }
     /* do_sync_*() commands */
     else if (!strcmp(argv[0], "ls")) {
@@ -1959,25 +1874,22 @@ int adb_commandline(int argc, const char** argv) {
     } else if (!strcmp(argv[0], "push")) {
         bool copy_attrs = false;
         bool sync = false;
-        bool dry_run = false;
-        CompressionType compression = CompressionType::Any;
+        bool compressed = true;
         std::vector<const char*> srcs;
         const char* dst = nullptr;
 
-        parse_push_pull_args(&argv[1], argc - 1, &srcs, &dst, &copy_attrs, &sync, &compression,
-                             &dry_run);
+        parse_push_pull_args(&argv[1], argc - 1, &srcs, &dst, &copy_attrs, &sync, &compressed);
         if (srcs.empty() || !dst) error_exit("push requires an argument");
-        return do_sync_push(srcs, dst, sync, compression, dry_run) ? 0 : 1;
+        return do_sync_push(srcs, dst, sync, compressed) ? 0 : 1;
     } else if (!strcmp(argv[0], "pull")) {
         bool copy_attrs = false;
-        CompressionType compression = CompressionType::None;
+        bool compressed = true;
         std::vector<const char*> srcs;
         const char* dst = ".";
 
-        parse_push_pull_args(&argv[1], argc - 1, &srcs, &dst, &copy_attrs, nullptr, &compression,
-                             nullptr);
+        parse_push_pull_args(&argv[1], argc - 1, &srcs, &dst, &copy_attrs, nullptr, &compressed);
         if (srcs.empty()) error_exit("pull requires an argument");
-        return do_sync_pull(srcs, dst, copy_attrs, compression) ? 0 : 1;
+        return do_sync_pull(srcs, dst, copy_attrs, compressed) ? 0 : 1;
     } else if (!strcmp(argv[0], "install")) {
         if (argc < 2) error_exit("install requires an argument");
         return install_app(argc, argv);
@@ -1993,30 +1905,27 @@ int adb_commandline(int argc, const char** argv) {
     } else if (!strcmp(argv[0], "sync")) {
         std::string src;
         bool list_only = false;
-        bool dry_run = false;
-        CompressionType compression = CompressionType::Any;
+        bool compressed = true;
 
-        if (const char* adb_compression = getenv("ADB_COMPRESSION"); adb_compression) {
-            compression = parse_compression_type(adb_compression, true);
+        const char* adb_compression = getenv("ADB_COMPRESSION");
+        if (adb_compression && strcmp(adb_compression, "0") == 0) {
+            compressed = false;
         }
 
         int opt;
-        while ((opt = getopt(argc, const_cast<char**>(argv), "lnz:Z")) != -1) {
+        while ((opt = getopt(argc, const_cast<char**>(argv), "lzZ")) != -1) {
             switch (opt) {
                 case 'l':
                     list_only = true;
                     break;
-                case 'n':
-                    dry_run = true;
-                    break;
                 case 'z':
-                    compression = parse_compression_type(optarg, false);
+                    compressed = true;
                     break;
                 case 'Z':
-                    compression = CompressionType::None;
+                    compressed = false;
                     break;
                 default:
-                    error_exit("usage: adb sync [-l] [-n]  [-z ALGORITHM] [-Z] [PARTITION]");
+                    error_exit("usage: adb sync [-lzZ] [PARTITION]");
             }
         }
 
@@ -2025,7 +1934,7 @@ int adb_commandline(int argc, const char** argv) {
         } else if (optind + 1 == argc) {
             src = argv[optind];
         } else {
-            error_exit("usage: adb sync [-l] [-n] [-z ALGORITHM] [-Z] [PARTITION]");
+            error_exit("usage: adb sync [-lzZ] [PARTITION]");
         }
 
         std::vector<std::string> partitions{"data",   "odm",        "oem",   "product",
@@ -2036,9 +1945,7 @@ int adb_commandline(int argc, const char** argv) {
                 std::string src_dir{product_file(partition)};
                 if (!directory_exists(src_dir)) continue;
                 found = true;
-                if (!do_sync_sync(src_dir, "/" + partition, list_only, compression, dry_run)) {
-                    return 1;
-                }
+                if (!do_sync_sync(src_dir, "/" + partition, list_only, compressed)) return 1;
             }
         }
         if (!found) error_exit("don't know how to sync %s partition", src.c_str());
@@ -2078,17 +1985,6 @@ int adb_commandline(int argc, const char** argv) {
         return adb_connect_command("jdwp");
     } else if (!strcmp(argv[0], "track-jdwp")) {
         return adb_connect_command("track-jdwp");
-    } else if (!strcmp(argv[0], "track-app")) {
-        std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
-        }
-        if (!CanUseFeature(*features, kFeatureTrackApp)) {
-            error_exit("track-app is not supported by the device");
-        }
-        TrackAppStreamsCallback callback;
-        return adb_connect_command("track-app", nullptr, &callback);
     } else if (!strcmp(argv[0], "track-devices")) {
         if (argc > 2 || (argc == 2 && strcmp(argv[1], "-l"))) {
             error_exit("usage: adb track-devices [-l]");
@@ -2110,14 +2006,15 @@ int adb_commandline(int argc, const char** argv) {
         return 0;
     } else if (!strcmp(argv[0], "features")) {
         // Only list the features common to both the adb client and the device.
+        FeatureSet features;
         std::string error;
-        auto&& features = adb_get_feature_set(&error);
-        if (!features) {
-            error_exit("%s", error.c_str());
+        if (!adb_get_feature_set(&features, &error)) {
+            fprintf(stderr, "error: %s\n", error.c_str());
+            return 1;
         }
 
-        for (const std::string& name : *features) {
-            if (CanUseFeature(*features, name)) {
+        for (const std::string& name : features) {
+            if (CanUseFeature(features, name)) {
                 printf("%s\n", name.c_str());
             }
         }

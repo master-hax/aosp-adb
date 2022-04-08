@@ -20,7 +20,7 @@
 
 #include <android-base/unique_fd.h>
 
-#include "adbconnection/process_info.h"
+extern "C" {
 
-// Note this is NOT an apex interface as it's linked only into adbd.
-void adbconnection_listen(void (*callback)(int fd, ProcessInfo process));
+void adbconnection_listen(void (*callback)(int fd, pid_t pid));
+}

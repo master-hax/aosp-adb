@@ -51,9 +51,9 @@
 #include "adb_auth.h"
 #include "adb_io.h"
 #include "adb_listeners.h"
-#include "adb_mdns.h"
 #include "adb_unique_fd.h"
 #include "adb_utils.h"
+#include "adb_wifi.h"
 #include "sysdeps/chrono.h"
 #include "transport.h"
 
@@ -68,25 +68,6 @@ using namespace std::chrono_literals;
 
 #if ADB_HOST
 #include "client/usb.h"
-#endif
-
-#if !ADB_HOST && defined(__ANDROID__)
-#include "daemon/watchdog.h"
-
-static std::atomic<int> active_connections = 0;
-
-static void IncrementActiveConnections() {
-    if (active_connections++ == 0) {
-        watchdog::Stop();
-    }
-}
-
-static void DecrementActiveConnections() {
-    if (--active_connections == 0) {
-        watchdog::Start();
-    }
-}
-
 #endif
 
 std::string adb_version() {
@@ -128,11 +109,7 @@ void handle_online(atransport *t)
 {
     D("adb: online");
     t->online = 1;
-#if ADB_HOST
     t->SetConnectionEstablished(true);
-#elif defined(__ANDROID__)
-    IncrementActiveConnections();
-#endif
 }
 
 void handle_offline(atransport *t)
@@ -143,10 +120,6 @@ void handle_offline(atransport *t)
     }
 
     LOG(INFO) << t->serial_name() << ": offline";
-
-#if !ADB_HOST && defined(__ANDROID__)
-    DecrementActiveConnections();
-#endif
 
     t->SetConnectionState(kCsOffline);
 
@@ -1047,12 +1020,8 @@ bool handle_forward_request(const char* service,
         if (kill_forward) {
             r = remove_listener(pieces[0].c_str(), transport);
         } else {
-            int flags = 0;
-            if (no_rebind) {
-                flags |= INSTALL_LISTENER_NO_REBIND;
-            }
-            r = install_listener(pieces[0], pieces[1].c_str(), transport, flags, &resolved_tcp_port,
-                                 &error);
+            r = install_listener(pieces[0], pieces[1].c_str(), transport, no_rebind,
+                                 &resolved_tcp_port, &error);
         }
         if (r == INSTALL_STATUS_OK) {
 #if ADB_HOST
@@ -1098,44 +1067,19 @@ static int SendOkay(int fd, const std::string& s) {
     return 0;
 }
 
-static bool g_reject_kill_server = false;
-void adb_set_reject_kill_server(bool value) {
-    g_reject_kill_server = value;
-}
-
-static bool handle_mdns_request(std::string_view service, int reply_fd) {
-    if (!android::base::ConsumePrefix(&service, "mdns:")) {
-        return false;
-    }
-
-    if (service == "check") {
-        std::string check = mdns_check();
-        SendOkay(reply_fd, check);
-        return true;
-    }
-    if (service == "services") {
-        std::string services_list = mdns_list_discovered_services();
-        SendOkay(reply_fd, services_list);
-        return true;
-    }
-
-    return false;
-}
-
 HostRequestResult handle_host_request(std::string_view service, TransportType type,
                                       const char* serial, TransportId transport_id, int reply_fd,
                                       asocket* s) {
     if (service == "kill") {
-        if (g_reject_kill_server) {
-            LOG(WARNING) << "adb server ignoring kill-server";
-            SendFail(reply_fd, "kill-server rejected by remote server");
-        } else {
-            fprintf(stderr, "adb server killed by remote request\n");
-            SendOkay(reply_fd);
+        fprintf(stderr, "adb server killed by remote request\n");
+        fflush(stdout);
 
-            // Rely on process exit to close the socket for us.
-            exit(0);
-        }
+        // Send a reply even though we don't read it anymore, so that old versions
+        // of adb that do read it don't spew error messages.
+        SendOkay(reply_fd);
+
+        // Rely on process exit to close the socket for us.
+        exit(0);
     }
 
     LOG(DEBUG) << "handle_host_request(" << service << ")";
@@ -1244,9 +1188,9 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
         FeatureSet features = supported_features();
         // Abuse features to report libusb status.
         if (should_use_libusb()) {
-            features.emplace_back(kFeatureLibusb);
+            features.insert(kFeatureLibusb);
         }
-        features.emplace_back(kFeaturePushSync);
+        features.insert(kFeaturePushSync);
         SendOkay(reply_fd, FeatureSetToString(features));
         return HostRequestResult::Handled;
     }
@@ -1257,14 +1201,6 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
         if (address.empty()) {
             kick_all_tcp_devices();
             SendOkay(reply_fd, "disconnected everything");
-            return HostRequestResult::Handled;
-        }
-
-        // Mdns instance named device
-        atransport* t = find_transport(address.c_str());
-        if (t != nullptr) {
-            kick_transport(t);
-            SendOkay(reply_fd, android::base::StringPrintf("disconnected %s", address.c_str()));
             return HostRequestResult::Handled;
         }
 
@@ -1279,7 +1215,7 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
                                                            address.c_str(), error.c_str()));
             return HostRequestResult::Handled;
         }
-        t = find_transport(serial.c_str());
+        atransport* t = find_transport(serial.c_str());
         if (t == nullptr) {
             SendFail(reply_fd, android::base::StringPrintf("no such device '%s'", serial.c_str()));
             return HostRequestResult::Handled;
@@ -1371,10 +1307,6 @@ HostRequestResult handle_host_request(std::string_view service, TransportType ty
         }
     };
     if (handle_forward_request(service_str.c_str(), transport_acquirer, reply_fd)) {
-        return HostRequestResult::Handled;
-    }
-
-    if (handle_mdns_request(service, reply_fd)) {
         return HostRequestResult::Handled;
     }
 

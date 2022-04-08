@@ -57,12 +57,13 @@ enum class CmdlineOption { None, Enable, Disable };
 }
 
 static bool can_use_feature(const char* feature) {
-    // We ignore errors here, if the device is missing, we'll notice when we try to push install.
-    auto&& features = adb_get_feature_set(nullptr);
-    if (!features) {
+    FeatureSet features;
+    std::string error;
+    if (!adb_get_feature_set(&features, &error)) {
+        fprintf(stderr, "error: %s\n", error.c_str());
         return false;
     }
-    return CanUseFeature(*features, feature);
+    return CanUseFeature(features, feature);
 }
 
 static InstallMode best_install_mode() {
@@ -292,7 +293,7 @@ static int install_app_legacy(int argc, const char** argv, bool use_fastdeploy) 
         }
     }
 
-    if (do_sync_push(apk_file, apk_dest.c_str(), false, CompressionType::Any, false)) {
+    if (do_sync_push(apk_file, apk_dest.c_str(), false, true)) {
         result = pm_command(argc, argv);
         delete_device_file(apk_dest);
     }
@@ -876,7 +877,7 @@ int install_multi_package(int argc, const char** argv) {
                     "-S",
                     std::to_string(sb.st_size),
                     session_id_str,
-                    android::base::StringPrintf("%d_%s", i, android::base::Basename(split).c_str()),
+                    android::base::StringPrintf("%d_%s", i, android::base::Basename(file).c_str()),
                     "-",
             };
 
@@ -930,22 +931,11 @@ int install_multi_package(int argc, const char** argv) {
 
 finalize_multi_package_session:
     // Commit session if we streamed everything okay; otherwise abandon
-    std::vector<std::string> service_args;
-    if (success == 0) {
-        service_args.push_back(install_cmd);
-        service_args.push_back("install-commit");
-        // If successful, we need to forward args to install-commit
-        for (int i = 1; i < first_package - 1; i++) {
-            if (strcmp(argv[i], "--staged-ready-timeout") == 0) {
-                service_args.push_back(argv[i]);
-                service_args.push_back(argv[i + 1]);
-                i++;
-            }
-        }
-        service_args.push_back(parent_session_id_str);
-    } else {
-        service_args = {install_cmd, "install-abandon", parent_session_id_str};
-    }
+    std::vector<std::string> service_args = {
+            install_cmd,
+            success == 0 ? "install-commit" : "install-abandon",
+            parent_session_id_str,
+    };
 
     {
         unique_fd fd = send_command(service_args, &error);

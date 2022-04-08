@@ -48,9 +48,6 @@ struct fdevent_context_poll final : public fdevent_context {
     fdevent_context_poll();
     virtual ~fdevent_context_poll();
 
-    virtual void Register(fdevent* fde) final;
-    virtual void Unregister(fdevent* fde) final;
-
     virtual void Set(fdevent* fde, unsigned events) final;
 
     virtual void Loop() final;

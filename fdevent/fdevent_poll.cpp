@@ -211,7 +211,3 @@ void fdevent_context_poll::Interrupt() {
         PLOG(FATAL) << "failed to write to fdevent interrupt fd";
     }
 }
-
-void fdevent_context_poll::Register(fdevent*) {}
-
-void fdevent_context_poll::Unregister(fdevent*) {}

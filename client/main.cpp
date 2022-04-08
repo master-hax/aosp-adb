@@ -34,7 +34,6 @@
 #include "adb_auth.h"
 #include "adb_client.h"
 #include "adb_listeners.h"
-#include "adb_mdns.h"
 #include "adb_utils.h"
 #include "adb_wifi.h"
 #include "client/usb.h"
@@ -68,11 +67,9 @@ void adb_server_cleanup() {
     //   1. close_smartsockets, so that we don't get any new clients
     //   2. kick_all_transports, to avoid writing only part of a packet to a transport.
     //   3. usb_cleanup, to tear down the USB stack.
-    //   4. mdns_cleanup, to tear down mdns stack.
     close_smartsockets();
     kick_all_transports();
     usb_cleanup();
-    mdns_cleanup();
 }
 
 static void intentionally_leak() {
@@ -108,12 +105,7 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
         fdevent_run_on_main_thread([]() { exit(0); });
     });
 
-    const char* reject_kill_server = getenv("ADB_REJECT_KILL_SERVER");
-    if (reject_kill_server && strcmp(reject_kill_server, "1") == 0) {
-        adb_set_reject_kill_server(true);
-    }
-
-    const char* leak = getenv("ADB_LEAK");
+    char* leak = getenv("ADB_LEAK");
     if (leak && strcmp(leak, "1") == 0) {
         intentionally_leak();
     }
@@ -134,11 +126,7 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
     }
 
     if (!getenv("ADB_USB") || strcmp(getenv("ADB_USB"), "0") != 0) {
-        if (should_use_libusb()) {
-            libusb::usb_init();
-        } else {
-            usb_init();
-        }
+        usb_init();
     } else {
         adb_notify_device_scan_complete();
     }
@@ -152,10 +140,9 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
     auto start = std::chrono::steady_clock::now();
 
     // If we told a previous adb server to quit because of version mismatch, we can get to this
-    // point before it's finished exiting. Retry for a while to give it some time. Don't actually
-    // accept any connections until adb_wait_for_device_initialization finishes below.
-    while (install_listener(socket_spec, "*smartsocket*", nullptr, INSTALL_LISTENER_DISABLED,
-                            nullptr, &error) != INSTALL_STATUS_OK) {
+    // point before it's finished exiting. Retry for a while to give it some time.
+    while (install_listener(socket_spec, "*smartsocket*", nullptr, 0, nullptr, &error) !=
+           INSTALL_STATUS_OK) {
         if (std::chrono::steady_clock::now() - start > 0.5s) {
             LOG(FATAL) << "could not install *smartsocket* listener: " << error;
         }
@@ -176,14 +163,12 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
             PLOG(FATAL) << "setsid() failed";
         }
 #endif
-    }
 
-    // Wait for the USB scan to complete before notifying the parent that we're up.
-    // We need to perform this in a thread, because we would otherwise block the event loop.
-    std::thread notify_thread([ack_reply_fd]() {
-        adb_wait_for_device_initialization();
+        // Wait for the USB scan to complete before notifying the parent that we're up.
+        // We need to perform this in a thread, because we would otherwise block the event loop.
+        std::thread notify_thread([ack_reply_fd]() {
+            adb_wait_for_device_initialization();
 
-        if (ack_reply_fd >= 0) {
             // Any error output written to stderr now goes to adb.log. We could
             // keep around a copy of the stderr fd and use that to write any errors
             // encountered by the following code, but that is probably overkill.
@@ -209,13 +194,9 @@ int adb_server_main(int is_daemon, const std::string& socket_spec, int ack_reply
             }
             unix_close(ack_reply_fd);
 #endif
-        }
-        // We don't accept() client connections until this point: this way, clients
-        // can't see wonky state early in startup even if they're connecting directly
-        // to the server instead of going through the adb program.
-        fdevent_run_on_main_thread([] { enable_server_sockets(); });
-    });
-    notify_thread.detach();
+        });
+        notify_thread.detach();
+    }
 
 #if defined(__linux__)
     // Write our location to .android/adb.$PORT, so that older clients can exec us.

@@ -42,7 +42,7 @@ static std::pair<unique_fd, std::vector<char>> read_signature(Size file_size,
     struct stat st;
     if (stat(signature_file.c_str(), &st)) {
         if (!silent) {
-            fprintf(stderr, "Failed to stat signature file %s.\n", signature_file.c_str());
+            fprintf(stderr, "Failed to stat signature file %s. Abort.\n", signature_file.c_str());
         }
         return {};
     }
@@ -50,35 +50,19 @@ static std::pair<unique_fd, std::vector<char>> read_signature(Size file_size,
     unique_fd fd(adb_open(signature_file.c_str(), O_RDONLY));
     if (fd < 0) {
         if (!silent) {
-            fprintf(stderr, "Failed to open signature file: %s.\n", signature_file.c_str());
+            fprintf(stderr, "Failed to open signature file: %s. Abort.\n", signature_file.c_str());
         }
         return {};
     }
 
     auto [signature, tree_size] = read_id_sig_headers(fd);
-
-    std::vector<char> invalid_signature;
-    if (signature.empty()) {
-        if (!silent) {
-            fprintf(stderr, "Invalid signature format. Abort.\n");
-        }
-        return {std::move(fd), std::move(invalid_signature)};
-    }
-    if (signature.size() > kMaxSignatureSize) {
-        if (!silent) {
-            fprintf(stderr, "Signature is too long: %lld. Max allowed is %d. Abort.\n",
-                    (long long)signature.size(), kMaxSignatureSize);
-        }
-        return {std::move(fd), std::move(invalid_signature)};
-    }
-
     if (auto expected = verity_tree_size_for_file(file_size); tree_size != expected) {
         if (!silent) {
             fprintf(stderr,
                     "Verity tree size mismatch in signature file: %s [was %lld, expected %lld].\n",
                     signature_file.c_str(), (long long)tree_size, (long long)expected);
         }
-        return {std::move(fd), std::move(invalid_signature)};
+        return {};
     }
 
     return {std::move(fd), std::move(signature)};
@@ -88,11 +72,9 @@ static std::pair<unique_fd, std::vector<char>> read_signature(Size file_size,
 static std::pair<unique_fd, std::string> read_and_encode_signature(Size file_size,
                                                                    std::string signature_file,
                                                                    bool silent) {
-    std::string encoded_signature;
-
     auto [fd, signature] = read_signature(file_size, std::move(signature_file), silent);
-    if (!fd.ok() || signature.empty()) {
-        return {std::move(fd), std::move(encoded_signature)};
+    if (!fd.ok()) {
+        return {};
     }
 
     size_t base64_len = 0;
@@ -100,10 +82,9 @@ static std::pair<unique_fd, std::string> read_and_encode_signature(Size file_siz
         if (!silent) {
             fprintf(stderr, "Fail to estimate base64 encoded length. Abort.\n");
         }
-        return {std::move(fd), std::move(encoded_signature)};
+        return {};
     }
-
-    encoded_signature.resize(base64_len, '\0');
+    std::string encoded_signature(base64_len, '\0');
     encoded_signature.resize(EVP_EncodeBlock((uint8_t*)encoded_signature.data(),
                                              (const uint8_t*)signature.data(), signature.size()));
 
@@ -128,7 +109,7 @@ static unique_fd start_install(const Files& files, const Args& passthrough_args,
         }
 
         auto [signature_fd, signature] = read_and_encode_signature(st.st_size, file, silent);
-        if (signature_fd.ok() && signature.empty()) {
+        if (!signature_fd.ok()) {
             return {};
         }
 
@@ -157,12 +138,9 @@ bool can_install(const Files& files) {
             return false;
         }
 
-        if (android::base::EndsWithIgnoreCase(file, ".apk")) {
-            // Signature has to be present for APKs.
-            auto [fd, _] = read_signature(st.st_size, file, /*silent=*/true);
-            if (!fd.ok()) {
-                return false;
-            }
+        auto [fd, _] = read_signature(st.st_size, file, true);
+        if (!fd.ok()) {
+            return false;
         }
     }
     return true;
@@ -179,19 +157,23 @@ std::optional<Process> install(const Files& files, const Args& passthrough_args,
 
     std::string adb_path = android::base::GetExecutablePath();
 
-    auto osh = cast_handle_to_int(adb_get_os_handle(connection_fd.get()));
+    auto osh = adb_get_os_handle(connection_fd.get());
+#ifdef _WIN32
+    auto fd_param = std::to_string(reinterpret_cast<intptr_t>(osh));
+#else /* !_WIN32 a.k.a. Unix */
     auto fd_param = std::to_string(osh);
+#endif
 
     // pipe for child process to write output
     int print_fds[2];
     if (adb_socketpair(print_fds) != 0) {
         if (!silent) {
-            fprintf(stderr, "adb: failed to create socket pair for child to print to parent\n");
+            fprintf(stderr, "Failed to create socket pair for child to print to parent\n");
         }
         return {};
     }
     auto [pipe_read_fd, pipe_write_fd] = print_fds;
-    auto pipe_write_fd_param = std::to_string(cast_handle_to_int(adb_get_os_handle(pipe_write_fd)));
+    auto pipe_write_fd_param = std::to_string(intptr_t(adb_get_os_handle(pipe_write_fd)));
     close_on_exec(pipe_read_fd);
 
     std::vector<std::string> args(std::move(files));
@@ -213,15 +195,10 @@ std::optional<Process> install(const Files& files, const Args& passthrough_args,
     Result result = wait_for_installation(pipe_read_fd);
     adb_close(pipe_read_fd);
 
-    if (result != Result::Success) {
-        if (!silent) {
-            fprintf(stderr, "adb: install command failed");
-        }
-        return {};
+    if (result == Result::Success) {
+        // adb client exits now but inc-server can continue
+        serverKiller.release();
     }
-
-    // adb client exits now but inc-server can continue
-    serverKiller.release();
     return child;
 }
 
