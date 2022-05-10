@@ -29,6 +29,7 @@
 #include <cutils/sockets.h>
 
 #include "adb.h"
+#include "adb_auth.h"
 #include "adb_mdns.h"
 #include "adb_utils.h"
 #include "sysdeps.h"
@@ -185,6 +186,15 @@ bool is_local_socket_spec(std::string_view spec) {
 
 bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std::string* serial,
                          std::string* error) {
+#if !ADB_HOST
+    if (!socket_access_allowed) {  // Check whether this security suppression is
+        // active (initiated from minadbd), and if so disable socket communications
+        // for the (min)deamon.
+        *error = "Suppressing minadbd socket communications";
+        return false;
+    }
+#endif
+
     if (address.starts_with("tcp:")) {
         std::string hostname;
         int port_value = port ? *port : 0;
@@ -264,7 +274,7 @@ bool socket_spec_connect(unique_fd* fd, std::string_view address, int* port, std
             errno = EINVAL;
             return false;
         }
-        fd->reset(socket(AF_VSOCK, SOCK_STREAM, 0));
+        fd->reset(socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0));
         if (fd->get() == -1) {
             *error = "could not open vsock socket";
             return false;
@@ -374,7 +384,7 @@ int socket_spec_listen(std::string_view spec, std::string* error, int* resolved_
             errno = EINVAL;
             return -1;
         }
-        unique_fd serverfd(socket(AF_VSOCK, SOCK_STREAM, 0));
+        unique_fd serverfd(socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0));
         if (serverfd == -1) {
             int error_num = errno;
             *error = android::base::StringPrintf("could not create vsock server: '%s'",
