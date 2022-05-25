@@ -9,7 +9,7 @@ package {
 
 apex_defaults {
     name: "com.android.adbd-defaults",
-    defaults: ["r-launched-apex-module"],
+    updatable: true,
 
     binaries: ["adbd"],
     compile_multilib: "both",
@@ -44,7 +44,7 @@ library_linking_strategy_apex_defaults {
                 min_sdk_version: "30",
             },
             conditions_default: {
-                min_sdk_version: "current",
+                min_sdk_version: "31",
             },
         },
     },
@@ -63,6 +63,7 @@ apex_test {
     name: "test_com.android.adbd",
     defaults: ["com.android.adbd-defaults"],
     manifest: "test_apex_manifest.json",
+    min_sdk_version: "30",
     file_contexts: ":com.android.adbd-file_contexts",
     installable: false,
 }
