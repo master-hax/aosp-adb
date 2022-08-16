@@ -62,6 +62,7 @@ cc_defaults {
                 "-lpthread",
                 "-framework CoreFoundation",
                 "-framework IOKit",
+                "-framework Security",
                 "-lobjc",
             ],
             cflags: [
@@ -753,8 +754,15 @@ phony {
         "libadbd_fs",
         "abb",
         "reboot",
-        "set-verity-state",
-    ]
+    ],
+    product_variables: {
+        debuggable: {
+            required: [
+                "remount",
+                "set-verity-state",
+            ],
+        },
+    },
 }
 
 phony {
