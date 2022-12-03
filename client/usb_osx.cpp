@@ -110,6 +110,17 @@ static void AndroidInterfaceAdded(io_iterator_t iterator);
 static std::unique_ptr<usb_handle> CheckInterface(IOUSBInterfaceInterface550** iface, UInt16 vendor,
                                                   UInt16 product);
 
+// Flag-guarded (using host env variable) feature that turns on
+// the ability to clear the device-side endpoint also before
+// starting. See public bug https://issuetracker.google.com/issues/37055927
+// for historical context.
+static bool clear_endpoints() {
+    LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
+    static const char* env(getenv("ADB_OSX_USB_CLEAR_ENDPOINTS"));
+    static bool result = env && strcmp("1", env) == 0;
+    return result;
+}
+
 static bool FindUSBDevices() {
     // Create the matching dictionary to find the Android device's adb interface.
     CFMutableDictionaryRef matchingDict = IOServiceMatching(kIOUSBInterfaceClassName);
@@ -324,11 +335,22 @@ AndroidInterfaceAdded(io_iterator_t iterator)
 // When adb quits, we might clear the host endpoint but not the device.
 // So we make sure both sides are clear before starting up.
 static bool ClearPipeStallBothEnds(IOUSBInterfaceInterface550** interface, UInt8 bulkEp) {
+    // If feature-disabled, (silently) bypass clearing both
+    // endpoints (including device-side).
+    LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
+    if (!clear_endpoints()) {
+        LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
+        return true;
+    }
+    LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
+
     IOReturn rc = (*interface)->ClearPipeStallBothEnds(interface, bulkEp);
     if (rc != kIOReturnSuccess) {
         LOG(ERROR) << "Could not clear pipe stall both ends: " << std::hex << rc;
+        LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
         return false;
     }
+    LOG(INFO) << __PRETTY_FUNCTION__ << " " << __FILE__;
     return true;
 }
 
