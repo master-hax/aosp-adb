@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2018 The Android Open Source Project
+ * Copyright (C) 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,30 +14,11 @@
  * limitations under the License.
  */
 
-#pragma once
-
-#include <sys/types.h>
-
 #include "adb_unique_fd.h"
+#include "socket.h"
 
-#if defined(_WIN32)
-
-// Layout of this struct must match struct WSABUF (verified via static assert in sysdeps_win32.cpp)
-struct adb_iovec {
-    unsigned int iov_len;
-    void* iov_base;
-};
-
-ssize_t adb_writev(borrowed_fd fd, const adb_iovec* iov, int iovcnt);
-
-#else
-
-#include <sys/uio.h>
-using adb_iovec = struct iovec;
-inline ssize_t adb_writev(borrowed_fd fd, const adb_iovec* iov, int iovcnt) {
-    return writev(fd.get(), iov, iovcnt);
-}
-
-#endif
-
-#pragma GCC poison writev
+int init_jdwp(void);
+asocket* create_jdwp_service_socket();
+asocket* create_jdwp_tracker_service_socket();
+asocket* create_app_tracker_service_socket();
+unique_fd create_jdwp_connection_fd(int jdwp_pid);
